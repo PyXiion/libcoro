@@ -159,6 +159,10 @@ if(LIBCORO_FEATURE_NETWORKING)
         include/coro/net/tcp/client.hpp src/net/tcp/client.cpp
         include/coro/net/tcp/server.hpp src/net/tcp/server.cpp
         include/coro/net/udp/peer.hpp src/net/udp/peer.cpp
+
+        include/coro/net/packet/packet.hpp
+        include/coro/net/packet/packet_reader.hpp
+        include/coro/net/packet/packet_codec.hpp
     )
 
     if(LIBCORO_FEATURE_TLS)
