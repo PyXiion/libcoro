@@ -84,6 +84,9 @@ TEST_CASE("tcp_server ping server", "[tcp_server]")
         REQUIRE_THAT(wstatus, IsOk());
         REQUIRE(remaining.empty());
 
+        // Wait a bit for client to receive all data
+        co_await scheduler->yield_for(std::chrono::milliseconds{50});
+
         std::cerr << "server return\n";
         co_return;
     };
