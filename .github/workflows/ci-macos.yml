@@ -1,6 +1,11 @@
 name: ci-macos
 
-on: [pull_request, workflow_dispatch]
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
 
 jobs:
   macos:
