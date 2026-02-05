@@ -1,6 +1,9 @@
 name: ci-windows
 
-on: [pull_request, workflow_dispatch]
+on:
+  push:
+    branches:
+      - '**'
 
 jobs:
     ci-windows-2022:

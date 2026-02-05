@@ -1,6 +1,9 @@
 name: ci-ubuntu
 
-on: [pull_request, workflow_dispatch]
+on:
+  push:
+    branches:
+      - '**'
 
 jobs:
     ci-ubuntu-22-04-gplusplus:
