@@ -1,6 +1,9 @@
 name: ci-fedora
 
-on: [pull_request, workflow_dispatch]
+on:
+  push:
+    branches:
+      - '**'
 
 jobs:
     ci-fedora-gplusplus:
