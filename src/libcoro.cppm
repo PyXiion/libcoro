@@ -3,6 +3,7 @@
  */
 
 module;
+#include <chrono>
 #include "coro/coro.hpp"
 
 export module libcoro;
