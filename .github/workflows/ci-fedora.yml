@@ -6,72 +6,112 @@ on:
       - '**'
 
 jobs:
-    ci-fedora-gplusplus:
-        name: fedora-${{ matrix.fedora_version }}
-        runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                fedora_version: [37, 38, 39, 40, 41, 42, 43]
-                cxx_standard: [20, 23]
-                libcoro_feature_networking: [ {enabled: ON, tls: ON} ]
-                libcoro_build_shared_libs: [OFF]
-                # Define which versions support modules
-                include:
-                  - fedora_version: 37
-                    libcoro_feature_modules: OFF
-                  - fedora_version: 38
-                    libcoro_feature_modules: OFF
-                  - fedora_version: 39
-                    libcoro_feature_modules: ON
-                  - fedora_version: 40
-                    libcoro_feature_modules: ON
-                  - fedora_version: 41
-                    libcoro_feature_modules: ON
-                  - fedora_version: 42
-                    libcoro_feature_modules: ON
-                  - fedora_version: 43
-                    libcoro_feature_modules: ON
-        container:
-            image: fedora:${{ matrix.fedora_version }}
-        steps:
-            -   name: Install Dependencies
-                run: |
-                    sudo dnf install -y \
-                        cmake \
-                        git \
-                        ninja-build \
-                        gcc-c++ \
-                        openssl \
-                        openssl-devel \
-                        mold
-            -   name: Checkout
-                uses: actions/checkout@v4
-                with:
-                    submodules: recursive
-                    fetch-depth: 0
-                    fetch-tags: true
-            -   name: Mark repository as safe
-                run: git config --global --add safe.directory "*"
-            -   name: Release
-                run: |
-                    mkdir Release
-                    cd Release
-                    cmake \
-                        -GNinja \
-                        -DCMAKE_BUILD_TYPE=Release \
-                        -DCMAKE_C_COMPILER=gcc \
-                        -DCMAKE_CXX_COMPILER=g++ \
-                        -DCMAKE_CXX_STANDARD=${{ matrix.cxx_standard }} \
-                        -DLIBCORO_FEATURE_NETWORKING=${{ matrix.libcoro_feature_networking.enabled }} \
-                        -DLIBCORO_FEATURE_TLS=${{ matrix.libcoro_feature_networking.tls }} \
-                        -DLIBCORO_BUILD_SHARED_LIBS=${{ matrix.libcoro_build_shared_libs }} \
-                        -DLIBCORO_FEATURE_MODULES=${{ matrix.libcoro_feature_modules }} \
-                        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
-                        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
-                        ..
-                    cmake --build . --config Release
-            -   name: Test
-                run: |
-                    cd Release
-                    ctest --build-config Release -VV
+  ci-fedora-gplusplus:
+    name: fedora-${{ matrix.fedora_version }}-gcc (no modules)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora_version: [37, 38, 39, 40, 41, 42, 43]
+        cxx_standard: [20, 23]
+        libcoro_feature_networking: [{enabled: ON, tls: ON}]
+        libcoro_build_shared_libs: [OFF]
+    container:
+      image: fedora:${{ matrix.fedora_version }}
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo dnf install -y \
+            cmake \
+            git \
+            ninja-build \
+            gcc-c++ \
+            openssl \
+            openssl-devel \
+            mold
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Mark repository as safe
+        run: git config --global --add safe.directory "*"
+      - name: Release Build
+        run: |
+          mkdir Release
+          cd Release
+          cmake \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_CXX_STANDARD=${{ matrix.cxx_standard }} \
+            -DLIBCORO_FEATURE_NETWORKING=${{ matrix.libcoro_feature_networking.enabled }} \
+            -DLIBCORO_FEATURE_TLS=${{ matrix.libcoro_feature_networking.tls }} \
+            -DLIBCORO_BUILD_SHARED_LIBS=${{ matrix.libcoro_build_shared_libs }} \
+            -DLIBCORO_FEATURE_MODULES=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
+            ..
+          cmake --build . --config Release
+      - name: Test
+        run: |
+          cd Release
+          ctest --build-config Release -VV
+
+  ci-fedora-clang-modules:
+    name: fedora-${{ matrix.fedora_version }}-clang (with modules)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora_version: [40, 41, 42, 43]          # Start from ~F40; older Fedora have weaker clang modules support
+        cxx_standard: [20, 23]
+        libcoro_feature_networking: [{enabled: ON, tls: ON}]
+        libcoro_build_shared_libs: [OFF]
+    container:
+      image: fedora:${{ matrix.fedora_version }}
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo dnf install -y \
+            cmake \
+            git \
+            ninja-build \
+            clang \
+            clang-devel \
+            libstdc++-devel \
+            openssl \
+            openssl-devel \
+            mold
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Mark repository as safe
+        run: git config --global --add safe.directory "*"
+      - name: Release Build with Clang + Modules
+        run: |
+          mkdir Release
+          cd Release
+          cmake \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_STANDARD=${{ matrix.cxx_standard }} \
+            -DLIBCORO_FEATURE_NETWORKING=${{ matrix.libcoro_feature_networking.enabled }} \
+            -DLIBCORO_FEATURE_TLS=${{ matrix.libcoro_feature_networking.tls }} \
+            -DLIBCORO_BUILD_SHARED_LIBS=${{ matrix.libcoro_build_shared_libs }} \
+            -DLIBCORO_FEATURE_MODULES=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
+            ..
+          cmake --build . --config Release
+      - name: Test
+        run: |
+          cd Release
+          ctest --build-config Release -VV
