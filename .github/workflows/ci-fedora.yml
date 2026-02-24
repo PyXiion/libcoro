@@ -13,6 +13,22 @@ jobs:
                 cxx_standard: [20, 23]
                 libcoro_feature_networking: [ {enabled: ON, tls: ON} ]
                 libcoro_build_shared_libs: [OFF]
+                # Define which versions support modules
+                include:
+                  - fedora_version: 37
+                    libcoro_feature_modules: OFF
+                  - fedora_version: 38
+                    libcoro_feature_modules: OFF
+                  - fedora_version: 39
+                    libcoro_feature_modules: ON
+                  - fedora_version: 40
+                    libcoro_feature_modules: ON
+                  - fedora_version: 41
+                    libcoro_feature_modules: ON
+                  - fedora_version: 42
+                    libcoro_feature_modules: ON
+                  - fedora_version: 43
+                    libcoro_feature_modules: ON
         container:
             image: fedora:${{ matrix.fedora_version }}
         steps:
@@ -47,6 +63,7 @@ jobs:
                         -DLIBCORO_FEATURE_NETWORKING=${{ matrix.libcoro_feature_networking.enabled }} \
                         -DLIBCORO_FEATURE_TLS=${{ matrix.libcoro_feature_networking.tls }} \
                         -DLIBCORO_BUILD_SHARED_LIBS=${{ matrix.libcoro_build_shared_libs }} \
+                        -DLIBCORO_FEATURE_MODULES=${{ matrix.libcoro_feature_modules }} \
                         -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
                         -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
                         ..
