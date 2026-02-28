@@ -1,0 +1,49 @@
+name: ci-ram
+on:
+  pull_request:
+  workflow_dispatch:
+  # for testing
+  push:
+    branches:
+      - '**'
+
+jobs:
+  skynet-ram-limit:
+    runs-on: ubuntu-24.04
+    env:
+      MEMORY_LIMIT_GB: 3
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++-13 libssl-dev time
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: |
+          mkdir Build
+          cd Build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-13 ..
+          ninja
+
+      - name: Run RAM Test
+        run: |
+          cd Build
+          EXPECTED_LIMIT_KB=$(( $MEMORY_LIMIT_GB * 1024 * 1024 ))
+          
+          /usr/bin/time -v ./tests "[.ram]" 2> mem_stats.txt || exit 1
+          
+          cat mem_stats.txt
+          
+          MAX_RSS=$(grep "Maximum resident set size" mem_stats.txt | awk '{print $4}')
+          
+          if [ "$MAX_RSS" -gt "$EXPECTED_LIMIT_KB" ]; then
+            echo "FAILED: Memory usage ($MAX_RSS KB) exceeded limit ($EXPECTED_LIMIT_KB KB)"
+            exit 1
+          else
+            echo "PASSED: Memory usage within limits ($MAX_RSS KB)"
+          fi
