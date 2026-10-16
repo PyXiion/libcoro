@@ -23,14 +23,19 @@ class timer_handle;
 class io_notifier_epoll
 {
     static const constexpr std::size_t m_max_events = 16;
+    static constexpr const int m_wake_object{0};
 
     fd_t m_fd;
+    fd_t m_wake_fd{-1};
 
     friend class detail::timer_handle;
 
     static auto event_to_poll_status(const event_t& event) -> poll_status;
 
 public:
+    /// Tag reported by next_events() after consuming a wake signal.
+    static constexpr const void* wake_tag = &m_wake_object;
+
     io_notifier_epoll();
 
     io_notifier_epoll(const io_notifier_epoll&)                    = delete;
@@ -39,6 +44,9 @@ public:
     auto operator=(io_notifier_epoll&&) -> io_notifier_epoll&      = delete;
 
     ~io_notifier_epoll();
+
+    /// Wake a concurrent or the next next_events() call from any thread; multiple calls may coalesce.
+    auto wake() -> void;
 
     auto watch_timer(const timer_handle& timer, std::chrono::nanoseconds duration) -> bool;
 

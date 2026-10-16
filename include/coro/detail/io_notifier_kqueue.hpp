@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <vector>
 
@@ -23,6 +24,8 @@ class timer_handle;
 class io_notifier_kqueue
 {
     static const constexpr std::size_t m_max_events = 16;
+    static constexpr const int m_wake_object{0};
+    static constexpr std::uintptr_t m_wake_ident = 1;
 
     fd_t m_fd;
 
@@ -31,6 +34,9 @@ class io_notifier_kqueue
     static auto event_to_poll_status(const event_t& event) -> poll_status;
 
 public:
+    /// Tag reported by next_events() for wakeups.
+    static constexpr const void* wake_tag = &m_wake_object;
+
     io_notifier_kqueue();
 
     io_notifier_kqueue(const io_notifier_kqueue&)                    = delete;
@@ -51,6 +57,9 @@ public:
     auto unwatch(poll_info& pi) -> bool;
 
     auto unwatch_timer(const timer_handle& timer) -> bool;
+
+    /// Wakes a concurrent or subsequent next_events() call. Concurrent wakeups may coalesce.
+    auto wake() -> void;
 
     auto next_events(std::vector<std::pair<poll_info*, poll_status>>& ready_events, std::chrono::milliseconds timeout)
         -> void;

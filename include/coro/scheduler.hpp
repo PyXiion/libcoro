@@ -1,7 +1,6 @@
 #pragma once
 
 #include "coro/detail/awaiter_list.hpp"
-#include "coro/detail/pipe.hpp"
 #include "coro/detail/poll_info.hpp"
 #include "coro/detail/timer_handle.hpp"
 #include "coro/expected.hpp"
@@ -23,8 +22,6 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-
-#include <unistd.h>
 
 namespace coro
 {
@@ -154,17 +151,10 @@ public:
 
                 // Trigger the event to wake-up the scheduler if this event isn't currently triggered.
                 bool expected{false};
-                if (m_scheduler.m_schedule_pipe_triggered.compare_exchange_strong(
+                if (m_scheduler.m_schedule_triggered.compare_exchange_strong(
                         expected, true, std::memory_order::release, std::memory_order::relaxed))
                 {
-                    constexpr int control = 1;
-                    ssize_t       written = m_scheduler.m_schedule_pipe.write(&control, sizeof(control));
-                    if (written != sizeof(control))
-                    {
-                        std::cerr
-                            << "libcoro::scheduler::schedule_operation failed to write to schedule pipe, bytes written="
-                            << written << "\n";
-                    }
+                    m_scheduler.m_io_notifier.wake();
                 }
             }
             else
@@ -465,12 +455,8 @@ private:
     ::coro::io_notifier m_io_notifier;
     /// The timer handle for timed events, e.g. yield_for() or scheduler_after().
     detail::timer_handle m_timer;
-    /// The event loop pipe to trigger a shutdown.
-    detail::pipe_t m_shutdown_pipe{};
-    /// The event loop schedule task pipe.
-    detail::pipe_t m_schedule_pipe{};
-    /// @brief Scheduled operations waiting tasks has entries.
-    std::atomic<bool> m_schedule_pipe_triggered{false};
+    /// Whether scheduled operations have already requested an event loop wake-up.
+    std::atomic<bool> m_schedule_triggered{false};
     /// @brief Scheduled operations waiting to be resumed.
     std::atomic<schedule_operation*> m_scheduled_ops{nullptr};
 
@@ -500,14 +486,8 @@ private:
 
     auto process_scheduled_execute_inline() -> void;
 
-    static constexpr const int   m_shutdown_object{0};
-    static constexpr const void* m_shutdown_ptr = &m_shutdown_object;
-
     static constexpr const int   m_timer_object{0};
     static constexpr const void* m_timer_ptr = &m_timer_object;
-
-    static constexpr const int   m_schedule_object{0};
-    static constexpr const void* m_schedule_ptr = &m_schedule_object;
 
     static const constexpr std::chrono::milliseconds              m_default_timeout{1000};
     static const constexpr std::chrono::milliseconds              m_no_timeout{0};

@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
 
 #include "coro/detail/poll_info.hpp"
@@ -23,6 +24,16 @@ static auto poll_op_to_filter(poll_op op) -> int16_t
 
 io_notifier_kqueue::io_notifier_kqueue() : m_fd{::kqueue()}
 {
+    auto event_data = event_t{};
+    EV_SET(&event_data, m_wake_ident, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, const_cast<void*>(wake_tag));
+    if (::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) == -1)
+    {
+        if (m_fd != -1)
+        {
+            ::close(m_fd);
+        }
+        throw std::runtime_error{"failed to register kqueue wake event"};
+    }
 }
 
 io_notifier_kqueue::~io_notifier_kqueue()
@@ -125,6 +136,16 @@ auto io_notifier_kqueue::unwatch_timer(const timer_handle& timer) -> bool
     return ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) != -1;
 }
 
+auto io_notifier_kqueue::wake() -> void
+{
+    auto event_data = event_t{};
+    EV_SET(&event_data, m_wake_ident, EVFILT_USER, 0, NOTE_TRIGGER, 0, const_cast<void*>(wake_tag));
+    if (::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) == -1)
+    {
+        std::cerr << "failed to trigger kqueue wake event\n";
+    }
+}
+
 auto io_notifier_kqueue::next_events(
     std::vector<std::pair<poll_info*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
 {
@@ -138,7 +159,18 @@ auto io_notifier_kqueue::next_events(
         m_fd, nullptr, 0, ready_set.data(), std::min(ready_set.size(), ready_events.capacity()), &timeout_spec);
     for (int i = 0; i < num_ready; i++)
     {
+        if (ready_set[i].filter == EVFILT_USER && ready_set[i].udata == wake_tag)
+        {
+            ready_events.emplace_back(static_cast<poll_info*>(const_cast<void*>(wake_tag)), poll_status::read);
+            continue;
+        }
+
         auto* pi = static_cast<poll_info*>(ready_set[i].udata);
+        if (ready_set[i].filter == EVFILT_TIMER)
+        {
+            ready_events.emplace_back(pi, event_to_poll_status(ready_set[i]));
+            continue;
+        }
 
         auto keep_registered = !(ready_set[i].flags & EV_ONESHOT);
 
@@ -177,7 +209,7 @@ auto io_notifier_kqueue::event_to_poll_status(const event_t& event) -> poll_stat
     {
         return poll_status::error;
     }
-    else if (event.filter == EVFILT_READ)
+    else if (event.filter == EVFILT_READ || event.filter == EVFILT_USER)
     {
         return poll_status::read;
     }

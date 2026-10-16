@@ -1,8 +1,13 @@
 #include "coro/detail/io_notifier_epoll.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <iostream>
 #include <stdexcept>
+
+#include <sys/eventfd.h>
 
 #include "coro/detail/poll_info.hpp"
 #include "coro/detail/timer_handle.hpp"
@@ -59,14 +64,50 @@ auto decode_udata(uint64_t encoded) -> std::tuple<bool, bool, void*>
 
 io_notifier_epoll::io_notifier_epoll() : m_fd{::epoll_create1(EPOLL_CLOEXEC)}
 {
+    m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (m_wake_fd == -1)
+    {
+        ::close(m_fd);
+        throw std::runtime_error{"Failed to create eventfd"};
+    }
+    if (!watch(m_wake_fd, poll_op::read, const_cast<void*>(wake_tag), true))
+    {
+        ::close(m_wake_fd);
+        ::close(m_fd);
+        throw std::runtime_error{"Failed to register eventfd"};
+    }
 }
 
 io_notifier_epoll::~io_notifier_epoll()
 {
+    if (m_wake_fd != -1)
+    {
+        ::close(m_wake_fd);
+        m_wake_fd = -1;
+    }
     if (m_fd != -1)
     {
         ::close(m_fd);
         m_fd = -1;
+    }
+}
+
+auto io_notifier_epoll::wake() -> void
+{
+    uint64_t one = 1;
+    while (::write(m_wake_fd, &one, sizeof(one)) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        // EAGAIN means the counter is saturated, the wake is already pending.
+        if (errno != EAGAIN)
+        {
+            std::cerr << "::write(m_wake_fd) error[" << errno << "] " << ::strerror(errno) << " fd=[" << m_wake_fd
+                      << "]" << std::endl;
+        }
+        break;
     }
 }
 
@@ -153,7 +194,14 @@ auto io_notifier_epoll::next_events(
     for (int i = 0; i < num_ready; ++i)
     {
         auto [keep_registered, is_cancel_event, udata] = decode_udata(ready_set[i].data.u64);
-        auto* pi                                       = static_cast<poll_info*>(udata);
+        if (udata == wake_tag)
+        {
+            uint64_t value;
+            ::read(m_wake_fd, &value, sizeof(value));
+            ready_events.emplace_back(static_cast<poll_info*>(const_cast<void*>(wake_tag)), poll_status::read);
+            continue;
+        }
+        auto* pi = static_cast<poll_info*>(udata);
 
         // If the event issuing fd is the same as the fd of the cancellation trigger of the registered poll_info we
         // this operation was cancelled by the user.
@@ -168,7 +216,7 @@ auto io_notifier_epoll::next_events(
         else
         {
             ready_events.emplace_back(pi, io_notifier_epoll::event_to_poll_status(ready_set[i]));
-            if (pi->m_cancel_trigger.has_value() && !keep_registered)
+            if (!keep_registered && pi->m_cancel_trigger.has_value())
             {
                 unwatch(pi->m_cancel_trigger.value().native_handle(), poll_op::read);
             }
