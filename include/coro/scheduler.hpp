@@ -33,13 +33,6 @@ namespace net::dns
 template<concepts::io_executor executor_type>
 class resolver;
 }
-    #ifdef LIBCORO_FEATURE_TLS
-namespace net::tls
-{
-class client;
-class server;
-} // namespace net::tls
-    #endif
 #endif
 
 enum timeout_status
@@ -652,10 +645,6 @@ private:
 #ifdef LIBCORO_FEATURE_NETWORKING
     template<concepts::io_executor executor_type>
     friend class net::dns::resolver;
-    #ifdef LIBCORO_FEATURE_TLS
-    friend class net::tls::client;
-    friend class net::tls::server;
-    #endif
 #endif
 
     auto poll(

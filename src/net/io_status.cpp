@@ -159,6 +159,8 @@ auto coro::net::to_string(coro::net::io_status::kind k) -> std::string_view
             return "Native error code";
         case kind::message_too_big:
             return "Message is too big";
+        case kind::tls_error:
+            return "TLS protocol error";
         case kind::unknown:
         default:
             return "unknown";

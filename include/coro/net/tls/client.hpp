@@ -3,44 +3,52 @@
     #pragma once
 
     #include "coro/concepts/buffer.hpp"
-    #include "coro/scheduler.hpp"
-    #include "coro/net/connect.hpp"
-    #include "coro/net/ip_address.hpp"
+    #include "coro/net/io_status.hpp"
     #include "coro/net/socket.hpp"
+    #include "coro/net/socket_address.hpp"
     #include "coro/net/tls/connection_status.hpp"
     #include "coro/net/tls/context.hpp"
-    #include "coro/net/tls/recv_status.hpp"
-    #include "coro/net/tls/send_status.hpp"
-    #include "coro/poll.hpp"
+    #include "coro/scheduler.hpp"
     #include "coro/task.hpp"
 
+    #include <openssl/ssl.h>
+
+    #include <atomic>
     #include <chrono>
     #include <memory>
     #include <optional>
+    #include <stop_token>
 
 namespace coro::net::tls
 {
 class server;
 
+/**
+ * A TLS connection driven by the scheduler's completion operations.
+ * Read and write operations must not run concurrently on the same client: they share one SSL object.
+ */
 class client
 {
 public:
     /**
-     * Creates a new tls client that can connect to an ip address + port. By default, the socket
-     * created will be in non-blocking mode, meaning that any sending or receiving of data should
-     * be polled for event readiness prior.
+     * Creates a new tls client that can connect to an ip address + port.
      * @param scheduler The io scheduler to drive the tls client.
      * @param tls_ctx The tls context.
-     * @param opts See tls::client::options for more information.
+     * @param endpoint The address and port to connect to.
      */
     explicit client(
         std::unique_ptr<coro::scheduler>& scheduler,
-        std::shared_ptr<context>             tls_ctx,
-        const net::socket_address&                 endpoint);
+        std::shared_ptr<context>          tls_ctx,
+        const net::socket_address&        endpoint);
     client(const client&) = delete;
     client(client&& other) noexcept;
     auto operator=(const client&) noexcept -> client& = delete;
     auto operator=(client&& other) noexcept -> client&;
+    /**
+     * If shutdown() was not awaited, blocks the calling thread with coro::sync_wait() for up to 30 seconds while
+     * the TLS shutdown completes. That shutdown needs the scheduler's event loop, so destroying an un-shut-down
+     * client on the scheduler's event loop thread (inline execution or a manual process_events() caller) deadlocks.
+     */
     ~client();
 
     /**
@@ -52,212 +60,133 @@ public:
     /** @} */
 
     /**
-     * Connects to the address+port with the given timeout and completes the tls handshake.
-     * Once connected calling this function only returns the connected status, it will not reconnect.
-     * @param timeout How long to wait for the connection to establish? Timeout of zero is indefinite.
+     * Connects to the address+port and completes the TLS handshake.
+     * Once called, subsequent calls return the cached result rather than reconnecting.
+     * @param timeout Maximum total time for the TCP connection and TLS handshake; zero waits indefinitely.
+     * @param stop_token Requests cancellation; cancellation is cached as connection_status::error.
      * @return The result status of trying to connect.
      */
-    auto connect(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) -> coro::task<connection_status>;
+    auto connect(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}, std::stop_token stop_token = {})
+        -> coro::task<connection_status>;
 
     /**
-     * Receives incoming data into the given buffer. This function will automatically poll for readability.
-     * @param buffer Received bytes are written into this buffer up to the buffers size.
-     * @param timeout The amount of time to wait for data to arrive.
-     * @return The status of the recv call and a span of the bytes received (if any). The span of
-     *         bytes will be a subspan or full span of the given input buffer.
+     * Attempts to asynchronously read data into the provided buffer.
+     * The operation may read fewer bytes than requested; the returned span references the filled prefix.
+     * @note Operations on the same client must not run concurrently.
+     * @see read_exact()
+     * @param buffer Destination buffer to read data into.
+     * @param timeout Maximum time to wait for the read; zero waits indefinitely.
+     * @param stop_token Requests cancellation of the operation.
+     * @return The operation status and a span pointing to the read part of the buffer.
      */
     template<
         concepts::mutable_buffer buffer_type,
         typename element_type = typename concepts::mutable_buffer_traits<buffer_type>::element_type>
-    auto recv(buffer_type& buffer, std::optional<std::chrono::milliseconds> timeout = std::nullopt)
-        -> coro::task<std::pair<recv_status, std::span<element_type>>>
+    auto read_some(
+        buffer_type&                    buffer,
+        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
+        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
     {
         if (buffer.empty())
         {
-            co_return {recv_status::buffer_is_empty, std::span<element_type>{}};
+            co_return {io_status{io_status::kind::ok}, {}};
         }
-
-        auto* tls = m_tls_info.m_tls_ptr.get();
-
-        auto op = poll_op::read;
-
-        auto                                  first = true;
-        std::chrono::steady_clock::time_point start;
-        std::chrono::steady_clock::time_point stop;
-
-        while (true)
-        {
-            if (timeout.has_value())
-            {
-                auto& t = timeout.value();
-                if (!first)
-                {
-                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
-                    t -= duration;
-                    if (t <= std::chrono::microseconds{0})
-                    {
-                        co_return {recv_status::timeout, std::span<element_type>{}};
-                    }
-                }
-
-                first = false;
-                start = std::chrono::steady_clock::now();
-            }
-
-            auto pstatus = co_await poll(op, timeout.value_or(std::chrono::milliseconds{0}));
-            switch (pstatus)
-            {
-                case poll_status::read:
-                    break;
-                case poll_status::write:
-                    continue;
-                case poll_status::timeout:
-                    co_return {recv_status::timeout, std::span<element_type>{}};
-                case poll_status::error:
-                    co_return {recv_status::error, std::span<element_type>{}};
-                case poll_status::closed:
-                    co_return {recv_status::closed, std::span<element_type>{}};
-                case poll_status::cancelled:
-                    co_return {recv_status::cancelled, std::span<element_type>{}};
-            }
-
-            size_t bytes_recv{0};
-            ERR_clear_error();
-            int r = SSL_read_ex(tls, buffer.data(), buffer.size(), &bytes_recv);
-            if (timeout.has_value())
-            {
-                stop = std::chrono::steady_clock::now();
-            }
-            if (r <= 0)
-            {
-                int err = SSL_get_error(tls, r);
-                if (err == SSL_ERROR_WANT_READ)
-                {
-                    op = poll_op::read;
-                    continue;
-                }
-                else if (err == SSL_ERROR_WANT_WRITE)
-                {
-                    op = poll_op::write;
-                    continue;
-                }
-                else
-                {
-                    co_return {static_cast<recv_status>(err), std::span<element_type>{}};
-                }
-            }
-            else
-            {
-                co_return {recv_status::ok, std::span<element_type>{buffer.data(), static_cast<size_t>(bytes_recv)}};
-            }
-        }
+        auto [status, bytes_read] =
+            co_await read_some_impl(std::as_writable_bytes(std::span{buffer}), make_deadline(timeout), stop_token);
+        co_return {status, std::span<element_type>{buffer.data(), bytes_read}};
     }
 
     /**
-     * Sends outgoing data from the given buffer. If a partial write occurs then the returned span will
-     * contain a view into the unsent bytes. This function will automatically call for write-ability on the socket.
-     * @param buffer The data to write on the tls socket.
-     * @param timeout The amount of time to send the data before timing out.
-     * @return The status of the send call and a span of any remaining bytes not sent. If all bytes
-     *         were successfully sent the status will be 'ok' and the remaining span will be empty.
+     * Asynchronously reads until the buffer is filled or an error, cancellation or timeout occurs.
+     * The timeout is a soft overall deadline for the entire operation.
+     * @note Operations on the same client must not run concurrently.
+     * @see read_some()
+     * @param buffer Destination buffer to read data into.
+     * @param timeout Maximum total time allowed; zero waits indefinitely.
+     * @param stop_token Requests cancellation, preserving any data already read.
+     * @return The operation status and a span pointing to the filled prefix, including on failure.
+     */
+    template<
+        concepts::mutable_buffer buffer_type,
+        typename element_type = typename concepts::mutable_buffer_traits<buffer_type>::element_type>
+    auto read_exact(
+        buffer_type&                    buffer,
+        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
+        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
+    {
+        if (buffer.empty())
+        {
+            co_return {io_status{io_status::kind::ok}, {}};
+        }
+        auto [status, buf] = co_await read_exact_impl(std::as_writable_bytes(std::span{buffer}), timeout, stop_token);
+        co_return {status, std::span<element_type>{reinterpret_cast<element_type*>(buf.data()), buf.size()}};
+    }
+
+    /**
+     * Attempts to asynchronously write data from the provided buffer.
+     * The returned span always refers to the unsent portion of the original buffer.
+     * Plaintext accepted by SSL counts as sent even if flushing its ciphertext subsequently times out;
+     * pending ciphertext is retained and flushed by the next operation.
+     * @note Operations on the same client must not run concurrently.
+     * @see write_all()
+     * @param buffer Buffer containing the data to write.
+     * @param timeout Maximum time to wait for the write; zero waits indefinitely.
+     * @param stop_token Requests cancellation of the operation.
+     * @return The operation status and a span pointing to the unsent portion; empty if all data was sent.
      */
     template<
         concepts::const_buffer buffer_type,
         typename element_type = typename concepts::const_buffer_traits<buffer_type>::element_type>
-    auto send(const buffer_type& buffer, std::optional<std::chrono::milliseconds> timeout = std::nullopt)
-        -> coro::task<std::pair<send_status, std::span<element_type>>>
+    auto write_some(
+        const buffer_type&              buffer,
+        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
+        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
     {
-        // Make sure there is data to send.
+        static_assert(sizeof(element_type) == 1);
+
         if (buffer.empty())
         {
-            co_return {send_status::buffer_is_empty, std::span<element_type>{buffer.data(), buffer.size()}};
+            co_return {io_status{io_status::kind::ok}, {}};
         }
+        auto [status, bytes_written] =
+            co_await write_some_impl(std::as_bytes(std::span{buffer}), make_deadline(timeout), stop_token);
+        co_return {status, std::span<element_type>{buffer.data() + bytes_written, buffer.size() - bytes_written}};
+    }
 
-        auto* tls = m_tls_info.m_tls_ptr.get();
+    /**
+     * Asynchronously writes until all plaintext is accepted or an error, cancellation or timeout occurs.
+     * The timeout is a soft overall deadline for the entire operation.
+     * Plaintext accepted by SSL counts as sent even if flushing its ciphertext subsequently times out;
+     * pending ciphertext is retained and flushed by the next operation.
+     * @note Operations on the same client must not run concurrently.
+     * @see write_some()
+     * @param buffer The data to write to the socket.
+     * @param timeout Maximum total time allowed; zero waits indefinitely.
+     * @param stop_token Requests cancellation, preserving the unsent portion of the buffer.
+     * @return The operation status and a span pointing to the unsent portion; empty if all data was sent.
+     */
+    template<
+        concepts::const_buffer buffer_type,
+        typename element_type = typename concepts::const_buffer_traits<buffer_type>::element_type>
+    auto write_all(
+        const buffer_type&              buffer,
+        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
+        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
+    {
+        static_assert(sizeof(element_type) == 1);
 
-        auto op = poll_op::write;
-
-        auto                                  first = true;
-        std::chrono::steady_clock::time_point start;
-        std::chrono::steady_clock::time_point stop;
-
-        while (true)
+        if (buffer.empty())
         {
-            if (timeout.has_value())
-            {
-                auto& t = timeout.value();
-                if (!first)
-                {
-                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
-                    t -= duration;
-                    if (t <= std::chrono::microseconds{0})
-                    {
-                        co_return {send_status::timeout, std::span<element_type>{}};
-                    }
-                }
-
-                first = false;
-                start = std::chrono::steady_clock::now();
-            }
-
-            auto pstatus = co_await poll(op, timeout.value_or(std::chrono::milliseconds{0}));
-            switch (pstatus)
-            {
-                case poll_status::write:
-                    break;
-                case poll_status::read:
-                    continue;
-                case poll_status::timeout:
-                    co_return {send_status::timeout, std::span<element_type>{}};
-                case poll_status::error:
-                    co_return {send_status::error, std::span<element_type>{}};
-                case poll_status::closed:
-                    co_return {send_status::closed, std::span<element_type>{}};
-                case poll_status::cancelled:
-                    co_return {send_status::cancelled, std::span<element_type>{}};
-            }
-
-            size_t bytes_sent{0};
-            ERR_clear_error();
-            int r = SSL_write_ex(tls, buffer.data(), buffer.size(), &bytes_sent);
-            if (timeout.has_value())
-            {
-                stop = std::chrono::steady_clock::now();
-            }
-            if (r <= 0)
-            {
-                int err = SSL_get_error(tls, r);
-
-                if (err == SSL_ERROR_WANT_WRITE)
-                {
-                    op = poll_op::write;
-                    continue;
-                }
-                else if (err == SSL_ERROR_WANT_READ)
-                {
-                    op = poll_op::read;
-                    continue;
-                }
-                else
-                {
-                    co_return {static_cast<send_status>(err), std::span<element_type>{}};
-                }
-            }
-            else
-            {
-                co_return {
-                    send_status::ok, std::span<element_type>{buffer.data() + bytes_sent, buffer.size() - bytes_sent}};
-            }
+            co_return {io_status{io_status::kind::ok}, {}};
         }
+        auto [status, buf] = co_await write_all_impl(std::as_bytes(std::span{buffer}), timeout, stop_token);
+        co_return {status, std::span<element_type>{reinterpret_cast<element_type*>(buf.data()), buf.size()}};
     }
 
     /**
      * Shuts down the tls client with a 30 second timeout.
-     *
-     * IMPORTANT:
-     * This is very important to call manually for each client as the client's destructor will synchronously wait
-     * to shutdown if this isn't called before the client is destructed, possibly hanging the thread of execution
-     * until it completes.
+     * Always co_await this before destroying the client: otherwise the destructor blocks on the shutdown, which
+     * deadlocks when the destructor runs on the scheduler's event loop thread (see ~client()).
      * @return Task.
      */
     auto shutdown() -> coro::task<void>
@@ -268,13 +197,11 @@ public:
     template<typename rep, typename period>
     auto shutdown(std::chrono::duration<rep, period> timeout) -> coro::task<void>
     {
-        // Only allow the client to be shutdown once.
-        if (m_shutdown.exchange(true, std::memory_order::acq_rel) != false)
+        if (m_shutdown.exchange(true, std::memory_order::acq_rel))
         {
             co_return;
         }
 
-        // If the client exists and it didn't have an error.
         if (m_tls_info.m_tls_ptr != nullptr && !m_tls_info.m_tls_error)
         {
             co_await tls_shutdown_and_free(std::chrono::duration_cast<std::chrono::milliseconds>(timeout));
@@ -282,25 +209,26 @@ public:
     }
 
 private:
-    /**
-     * @param timeout How long to allow for the tls handshake to successfully complete?
-     * @return The result of the tls handshake.
-     */
-    auto handshake(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) -> coro::task<connection_status>;
+    using deadline = std::chrono::steady_clock::time_point;
 
-    /**
-     * Polls for the given operation on this client's socket.  This should be done prior to
-     * calling recv and after a send that doesn't send the entire buffer.
-     * @param op The poll operation to perform, use read for incoming data and write for outgoing.
-     * @param timeout The amount of time to wait for the poll event to be ready.  Use zero for infinte timeout.
-     * @return The status result of th poll operation.  When poll_status::read or poll_status::write is returned then
-     *         this specific event operation is ready.
-     */
-    auto poll(coro::poll_op op, std::chrono::milliseconds timeout = std::chrono::milliseconds{0})
-        -> coro::task<poll_status>
-    {
-        return m_scheduler->poll(m_socket.native_handle(), op, timeout);
-    }
+    static auto make_deadline(std::chrono::milliseconds timeout) -> deadline;
+
+    auto handshake(deadline deadline, std::stop_token stop_token) -> coro::task<io_status>;
+
+    template<typename ssl_call_type>
+    auto drive(ssl_call_type ssl_call, deadline deadline, std::stop_token stop_token, bool shutting_down = false)
+        -> coro::task<std::pair<int, io_status>>;
+    auto flush_ciphertext(deadline deadline, std::stop_token stop_token) -> coro::task<io_status>;
+    auto read_some_impl(std::span<std::byte> buffer, deadline deadline, std::stop_token stop_token)
+        -> coro::task<std::pair<io_status, std::size_t>>;
+    auto write_some_impl(std::span<const std::byte> buffer, deadline deadline, std::stop_token stop_token)
+        -> coro::task<std::pair<io_status, std::size_t>>;
+    auto read_exact_impl(std::span<std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
+        -> coro::task<std::pair<io_status, std::span<std::byte>>>;
+    auto
+        write_all_impl(std::span<const std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
+            -> coro::task<std::pair<io_status, std::span<const std::byte>>>;
+    auto tls_shutdown_and_free(std::chrono::milliseconds timeout) -> coro::task<void>;
 
     struct tls_deleter
     {
@@ -311,69 +239,34 @@ private:
 
     enum class tls_connection_type
     {
-        /// This connection is a client connecting to a server.
         connect,
-        /// This connection is an accepted connection on a sever.
         accept
     };
 
     struct tls_info
     {
-        tls_info() {}
-        explicit tls_info(tls_connection_type type) : m_tls_connection_type(type) {}
-        tls_info(const tls_info&) noexcept = delete;
-        tls_info(tls_info&& other) noexcept
-            : m_tls_connection_type(std::exchange(other.m_tls_connection_type, tls_connection_type::connect)),
-              m_tls_ptr(std::move(other.m_tls_ptr)),
-              m_tls_error(std::exchange(other.m_tls_error, false)),
-              m_tls_connection_status(std::move(other.m_tls_connection_status))
-        {
-        }
-
-        auto operator=(const tls_info&) noexcept -> tls_info& = delete;
-
-        auto operator=(tls_info&& other) noexcept -> tls_info&
-        {
-            if (std::addressof(other) != this)
-            {
-                m_tls_connection_type   = std::exchange(other.m_tls_connection_type, tls_connection_type::connect);
-                m_tls_ptr               = std::move(other.m_tls_ptr);
-                m_tls_error             = std::exchange(other.m_tls_error, false);
-                m_tls_connection_status = std::move(other.m_tls_connection_status);
-            }
-            return *this;
-        }
-
-        /// What kind of connection is this, client initiated connect or server side accept?
-        tls_connection_type m_tls_connection_type{tls_connection_type::connect};
-        /// OpenSSL ssl connection.
-        tls_unique_ptr m_tls_ptr{nullptr};
-        /// Was there an error with the SSL/TLS connection?
-        bool m_tls_error{false};
-        /// The result of the tls connection and handshake.
-        std::optional<connection_status> m_tls_connection_status{std::nullopt};
+        tls_connection_type          m_tls_connection_type{tls_connection_type::connect};
+        tls_unique_ptr               m_tls_ptr{nullptr};
+        bool                         m_tls_error{false};
+        std::unique_ptr<std::byte[]> m_ciphertext_buffer{nullptr};
+        std::size_t                  m_ciphertext_offset{0};
+        std::size_t                  m_ciphertext_size{0};
     };
 
-    /// The tls::server creates already connected clients and provides a tcp socket pre-built.
     friend server;
-    client(coro::scheduler* scheduler, std::shared_ptr<context> tls_ctx, net::socket socket, const net::socket_address& endpoint);
+    client(
+        coro::scheduler*           scheduler,
+        std::shared_ptr<context>   tls_ctx,
+        net::socket                socket,
+        const net::socket_address& endpoint);
 
-    /// The scheduler that will drive this tcp client.
-    coro::scheduler* m_scheduler{nullptr};
-    // The tls context.
-    std::shared_ptr<context> m_tls_ctx{nullptr};
-    /// Options for what server to connect to.
-    net::socket_address m_endpoint;
-    /// The tcp socket.
-    net::socket m_socket{-1};
-    /// Cache the status of the connect in the event the user calls connect() again.
+    coro::scheduler*                 m_scheduler{nullptr};
+    std::shared_ptr<context>         m_tls_ctx{nullptr};
+    net::socket_address              m_endpoint;
+    net::socket                      m_socket{-1};
     std::optional<connection_status> m_connect_status{std::nullopt};
-    /// SSL/TLS specific information.
-    tls_info m_tls_info{};
-    /// Flag to signal if this tls client has already been shutdown or not.
-    std::atomic<bool> m_shutdown{false};
-
-    auto tls_shutdown_and_free(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) -> coro::task<void>;
+    tls_info                         m_tls_info{};
+    std::atomic<bool>                m_shutdown{false};
 };
 
 } // namespace coro::net::tls

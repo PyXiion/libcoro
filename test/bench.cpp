@@ -820,51 +820,21 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
         {
             std::string in(64, '\0');
 
-            auto closed = false;
-            // Echo the messages until the socket is closed.
-            while (!closed)
+            // Echo the messages until the peer shuts down.
+            while (true)
             {
-                auto [rstatus, rspan] = co_await client.recv(in);
-                // std::cerr << "SERVER CONNECTION: rstatus =" << coro::net::tls::to_string(rstatus) << "\n";
-                std::string_view data{};
-                switch (rstatus)
+                auto [rstatus, rspan] = co_await client.read_some(in);
+                if (rstatus.is_closed())
                 {
-                    case coro::net::tls::recv_status::ok:
-                        REQUIRE_THREAD_SAFE(rstatus == coro::net::tls::recv_status::ok);
-                        data = std::string_view{rspan.begin(), rspan.end()};
-                        // std::cerr << "SERVER CONNECTION: recv() -> " << data << "\n";
-                        break;
-                    case coro::net::tls::recv_status::closed:
-                        // std::cerr << "SERVER CONNECTION: closed\n";
-                        REQUIRE_THREAD_SAFE(rspan.empty());
-                        closed = true;
-                        break;
-                    case coro::net::tls::recv_status::want_read:
-                    {
-                        // std::cerr << "SERVER CONNECTION: want_read\n";
-                    }
-                        continue;
-                    case coro::net::tls::recv_status::want_write:
-                    {
-                        // std::cerr << "SERVER CONNECTION: want_write\n";
-                    }
-                        continue;
-                    default:
-                        // std::cerr << "SERVER CONNECTION: error (closing)\n";
-                        closed = true;
-                        break;
-                }
-
-                if (closed)
-                {
+                    REQUIRE_THREAD_SAFE(rspan.empty());
                     break;
                 }
+                REQUIRE_THREAD_SAFE(rstatus.is_ok());
 
-                // std::cerr << "SERVER CONNECTION: client.send()\n";
-                auto [sstatus, remaining] = co_await client.send(data);
-                REQUIRE_THREAD_SAFE(sstatus == coro::net::tls::send_status::ok);
+                auto data                 = std::string_view{rspan.data(), rspan.size()};
+                auto [sstatus, remaining] = co_await client.write_all(data);
+                REQUIRE_THREAD_SAFE(sstatus.is_ok());
                 REQUIRE_THREAD_SAFE(remaining.empty());
-                // std::cerr << "SERVER CONNECTION: send() -> " << data << "\n";
             }
 
             co_await client.shutdown();
@@ -883,19 +853,14 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
             {"127.0.0.1", 8080}};
 
         listening++;
+        listening.notify_one();
 
         while (accepted.load(std::memory_order::acquire) < connections)
         {
-            auto pstatus = co_await server.poll(std::chrono::milliseconds{1});
-            if (pstatus == coro::poll_status::read)
-            {
-                auto c = co_await server.accept();
-                if (c.socket().is_ok())
-                {
-                    accepted.fetch_add(1, std::memory_order::release);
-                    server_scheduler->spawn_detached(make_on_connection_task(std::move(c), wait_for_clients));
-                }
-            }
+            auto client = co_await server.accept();
+            REQUIRE_THREAD_SAFE(client.has_value());
+            accepted.fetch_add(1, std::memory_order::release);
+            server_scheduler->spawn_detached(make_on_connection_task(std::move(*client), wait_for_clients));
         }
 
         // std::cerr << "SERVER: co_await wait_for_clients\n";
@@ -927,60 +892,30 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
             auto cstatus = co_await client.connect();
             REQUIRE_THREAD_SAFE(cstatus == coro::net::tls::connection_status::connected);
 
-            std::string in(64, '\0');
-            auto        closed = false;
+            std::string in(msg.size(), '\0');
 
             for (size_t i = 1; i <= messages_per_connection; ++i)
             {
                 auto req_start = std::chrono::steady_clock::now();
 
-                auto [sstatus, remaining] = co_await client.send(msg);
-                // std::cerr << "CLIENT: send() -> " << msg << "\n";
-                REQUIRE_THREAD_SAFE(sstatus == coro::net::tls::send_status::ok);
+                auto [sstatus, remaining] = co_await client.write_all(msg);
+                REQUIRE_THREAD_SAFE(sstatus.is_ok());
                 REQUIRE_THREAD_SAFE(remaining.empty());
 
-                // std::cerr << "CLIENT: recv()\n";
-                auto [rstatus, rspan] = co_await client.recv(in, {std::chrono::seconds{30}});
-                // std::cerr << "CLIENT: rstatus =" << coro::net::tls::to_string(rstatus) << "\n";
-                switch (rstatus)
+                auto [rstatus, rspan] = co_await client.read_exact(in, std::chrono::seconds{30});
+                if (rstatus.is_closed())
                 {
-                    case coro::net::tls::recv_status::ok:
-                    {
-                        REQUIRE_THREAD_SAFE(rstatus == coro::net::tls::recv_status::ok);
-                        auto data = std::string_view{rspan.begin(), rspan.end()};
-                        REQUIRE_THREAD_SAFE(data.length() > 0);
-                        // std::cerr << "CLIENT: recv() -> " << data << "\n";
-                    }
-                    break;
-                    case coro::net::tls::recv_status::closed:
-                        // std::cerr << "CLIENT: closed\n";
-                        REQUIRE_THREAD_SAFE(rspan.empty());
-                        closed = true;
-                        break;
-                    case coro::net::tls::recv_status::want_read:
-                    {
-                        // std::cerr << "CLIENT: want_read\n";
-                    }
-                        continue;
-                    case coro::net::tls::recv_status::want_write:
-                    {
-                        // std::cerr << "CLIENT: want_write\n";
-                    }
-                        continue;
-                    case ::coro::net::tls::recv_status::timeout:
-                        std::cerr << "client.recv() timeout, closing\n";
-                        closed = true;
-                        break;
-                    default:
-                        // std::cerr << "CLIENT: error (closing)\n";
-                        closed = true;
-                        break;
-                }
-
-                if (closed)
-                {
+                    REQUIRE_THREAD_SAFE(rspan.empty());
                     break;
                 }
+                if (rstatus.is_timeout())
+                {
+                    std::cerr << "client.read_exact() timeout, closing\n";
+                    break;
+                }
+                REQUIRE_THREAD_SAFE(rstatus.is_ok());
+                REQUIRE_THREAD_SAFE(rspan.size() == msg.size());
+                REQUIRE_THREAD_SAFE(in == msg);
 
                 auto req_stop = std::chrono::steady_clock::now();
                 histogram[std::chrono::duration_cast<std::chrono::milliseconds>(req_stop - req_start)]++;
@@ -1009,12 +944,8 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
     auto server_thread =
         std::thread{[&]() { coro::sync_wait(make_server_task(server_scheduler, listening, accepted)); }};
 
-    // The server can take a small bit of time to start up, if we don't wait for it to notify then
-    // the first few connections can easily fail to connect causing this test to fail.
-    while (listening < 1)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
+    // Wait until the listening socket has been created.
+    listening.wait(0);
 
     auto client_thread =
         std::thread{[&]()

@@ -191,8 +191,6 @@ if(LIBCORO_FEATURE_NETWORKING)
             include/coro/net/tls/client.hpp src/net/tls/client.cpp
             include/coro/net/tls/connection_status.hpp src/net/tls/connection_status.cpp
             include/coro/net/tls/context.hpp src/net/tls/context.cpp
-            include/coro/net/tls/recv_status.hpp src/net/tls/recv_status.cpp
-            include/coro/net/tls/send_status.hpp src/net/tls/send_status.cpp
             include/coro/net/tls/server.hpp src/net/tls/server.cpp
         )
     endif()

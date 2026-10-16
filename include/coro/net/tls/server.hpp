@@ -2,14 +2,13 @@
 
     #pragma once
 
+    #include "coro/expected.hpp"
     #include "coro/net/ip_address.hpp"
     #include "coro/net/socket.hpp"
     #include "coro/net/tls/client.hpp"
     #include "coro/task.hpp"
 
-    #include <fcntl.h>
     #include <stop_token>
-    #include <sys/socket.h>
 
 namespace coro
 {
@@ -31,10 +30,10 @@ public:
 
     explicit server(
         std::unique_ptr<coro::scheduler>& scheduler,
-        std::shared_ptr<context>             tls_ctx,
-        const net::socket_address&                 endpoint,
-        options                              opts = options{
-                                         .backlog = 128,
+        std::shared_ptr<context>          tls_ctx,
+        const net::socket_address&        endpoint,
+        options                           opts = options{
+            .backlog = 128,
         });
 
     server(const server&) = delete;
@@ -44,24 +43,15 @@ public:
     ~server() = default;
 
     /**
-     * Polls for new incoming tcp connections.
-     * @param timeout How long to wait for a new connection before timing out, zero waits indefinitely.
-     * @return The result of the poll, 'event' means the poll was successful and there is at least 1
-     *         connection ready to be accepted.
+     * Accepts an incoming connection and completes its TLS handshake.
+     * @param timeout Maximum time to wait for a connection; zero waits indefinitely.
+     * @param handshake_timeout Maximum time to complete the TLS handshake; zero waits indefinitely.
+     * @return The connected TLS client or the accept/handshake failure status.
      */
-    auto poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) -> coro::task<coro::poll_status>
-    {
-        return m_scheduler->poll(
-            m_accept_socket.native_handle(), coro::poll_op::read, timeout, m_stop_source.get_token());
-    }
-
-    /**
-     * Accepts an incoming tcp client connection.  On failure the tcp clients socket will be set to
-     * and invalid state, use the socket.is_value() to verify the client was correctly accepted.
-     * @param timeout The timeout to complete the TLS handshake.
-     * @return The newly connected tcp client connection.
-     */
-    auto accept(std::chrono::milliseconds timeout = std::chrono::seconds{30}) -> coro::task<coro::net::tls::client>;
+    auto accept(
+        std::chrono::milliseconds timeout           = std::chrono::milliseconds{0},
+        std::chrono::milliseconds handshake_timeout = std::chrono::seconds{30})
+        -> coro::task<expected<tls::client, io_status>>;
 
     /**
      * @return The tcp accept socket this server is using.
@@ -86,7 +76,7 @@ private:
     options m_options;
     /// The socket for accepting new tcp connections on.
     net::socket m_accept_socket{-1};
-    /// Stop signal to cancel a pending readiness operation.
+    /// Stop signal to cancel a pending accept or TLS handshake.
     std::stop_source m_stop_source{};
 };
 

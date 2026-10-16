@@ -14,16 +14,10 @@ enum class connection_status
     not_connected,
     /// The connection needs a coro::net::tls::context to perform the handshake.
     context_required,
-    /// The internal ssl memory alocation failed.
-    resource_allocation_failed,
-    /// Attempting to set the connections ssl socket/file descriptor failed.
-    set_fd_failure,
     /// The handshake had an error.
     handshake_failed,
     /// The connection timed out.
     timeout,
-    /// An error occurred while polling for read or write operations on the socket.
-    poll_error,
     /// The socket was unexpectedly closed while attempting the handshake.
     unexpected_close,
     /// The given ip address could not be parsed or is invalid.
