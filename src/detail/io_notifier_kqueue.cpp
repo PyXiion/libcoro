@@ -2,12 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 
-#include "coro/detail/poll_info.hpp"
+#include "coro/detail/async_operation.hpp"
 #include "coro/detail/timer_handle.hpp"
 #include "coro/platform.hpp"
 #include "coro/poll.hpp"
@@ -86,19 +87,49 @@ auto io_notifier_kqueue::watch(fd_t fd, poll_op op, void* data, bool keep) -> bo
     return ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) != -1;
 }
 
-auto io_notifier_kqueue::watch(poll_info& pi) -> bool
+auto io_notifier_kqueue::try_now(async_operation& op) -> bool
 {
-    if (!watch(pi.m_fd, pi.m_op, static_cast<void*>(&pi), false))
+    return perform_posix(op);
+}
+
+auto io_notifier_kqueue::submit(async_operation& op) -> bool
+{
+    if (!watch(op.m_fd, operation_poll_op(op), &op))
     {
+        op.m_submit_error = errno;
+        // A read-write registration can fail after its first filter was added.
+        unwatch(op.m_fd, operation_poll_op(op));
         return false;
     }
-
-    if (pi.m_cancel_trigger.has_value())
-    {
-        watch(pi.m_cancel_trigger.value().native_handle(), poll_op::read, static_cast<void*>(&pi));
-    }
-
+    op.m_registered = true;
     return true;
+}
+
+auto io_notifier_kqueue::complete_ready(async_operation& op, poll_status status) -> bool
+{
+    if (op.m_kind == async_op_kind::poll)
+    {
+        op.m_poll_status = status;
+    }
+    else if (!perform_posix(op))
+    {
+        if (watch(op.m_fd, operation_poll_op(op), &op))
+        {
+            return false;
+        }
+        op.m_status = net::make_io_status_from_native(errno);
+    }
+    cancel(op);
+    return true;
+}
+
+auto io_notifier_kqueue::cancel(async_operation& op) -> void
+{
+    if (op.m_registered)
+    {
+        unwatch(op.m_fd, operation_poll_op(op));
+        op.m_registered = false;
+    }
 }
 
 auto io_notifier_kqueue::unwatch(fd_t fd, poll_op op) -> bool
@@ -124,11 +155,6 @@ auto io_notifier_kqueue::unwatch(fd_t fd, poll_op op) -> bool
     }
 }
 
-auto io_notifier_kqueue::unwatch(poll_info& pi) -> bool
-{
-    return unwatch(pi.m_fd, pi.m_op);
-}
-
 auto io_notifier_kqueue::unwatch_timer(const timer_handle& timer) -> bool
 {
     auto event_data = event_t{};
@@ -140,14 +166,18 @@ auto io_notifier_kqueue::wake() -> void
 {
     auto event_data = event_t{};
     EV_SET(&event_data, m_wake_ident, EVFILT_USER, 0, NOTE_TRIGGER, 0, const_cast<void*>(wake_tag));
-    if (::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) == -1)
+    while (::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) == -1)
     {
-        std::cerr << "failed to trigger kqueue wake event\n";
+        if (errno != EINTR)
+        {
+            std::cerr << "failed to trigger kqueue wake event\n";
+            break;
+        }
     }
 }
 
 auto io_notifier_kqueue::next_events(
-    std::vector<std::pair<poll_info*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
+    std::vector<std::pair<async_operation*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
 {
     auto       ready_set       = std::array<event_t, m_max_events>{};
     const auto timeout_as_secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
@@ -155,44 +185,12 @@ auto io_notifier_kqueue::next_events(
                  .tv_sec  = timeout_as_secs.count(),
                  .tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - timeout_as_secs).count(),
     };
-    const int num_ready = ::kevent(
-        m_fd, nullptr, 0, ready_set.data(), std::min(ready_set.size(), ready_events.capacity()), &timeout_spec);
-    for (int i = 0; i < num_ready; i++)
+    const int num_ready =
+        ::kevent(m_fd, nullptr, 0, ready_set.data(), ready_set.size(), timeout.count() < 0 ? nullptr : &timeout_spec);
+    for (int i = 0; i < num_ready; ++i)
     {
-        if (ready_set[i].filter == EVFILT_USER && ready_set[i].udata == wake_tag)
-        {
-            ready_events.emplace_back(static_cast<poll_info*>(const_cast<void*>(wake_tag)), poll_status::read);
-            continue;
-        }
-
-        auto* pi = static_cast<poll_info*>(ready_set[i].udata);
-        if (ready_set[i].filter == EVFILT_TIMER)
-        {
-            ready_events.emplace_back(pi, event_to_poll_status(ready_set[i]));
-            continue;
-        }
-
-        auto keep_registered = !(ready_set[i].flags & EV_ONESHOT);
-
-        // If the event issuing fd is the same as the fd of the cancellation trigger of the registered poll_info we
-        // this operation was cancelled by the user.
-        if (pi->m_cancel_trigger.has_value() &&
-            ready_set[i].ident == static_cast<uintptr_t>(pi->m_cancel_trigger.value().native_handle()))
-        {
-            ready_events.emplace_back(pi, poll_status::cancelled);
-            if (!keep_registered)
-            {
-                unwatch(*pi);
-            }
-        }
-        else
-        {
-            ready_events.emplace_back(pi, io_notifier_kqueue::event_to_poll_status(ready_set[i]));
-            if (pi->m_cancel_trigger.has_value() && !keep_registered)
-            {
-                unwatch(pi->m_cancel_trigger.value().native_handle(), poll_op::read);
-            }
-        }
+        ready_events.emplace_back(
+            static_cast<async_operation*>(ready_set[i].udata), event_to_poll_status(ready_set[i]));
     }
 }
 

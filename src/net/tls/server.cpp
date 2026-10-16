@@ -33,7 +33,8 @@ server::server(server&& other)
     : m_scheduler(std::exchange(other.m_scheduler, nullptr)),
       m_tls_ctx(std::move(other.m_tls_ctx)),
       m_options(std::move(other.m_options)),
-      m_accept_socket(std::move(other.m_accept_socket))
+      m_accept_socket(std::move(other.m_accept_socket)),
+      m_stop_source(std::move(other.m_stop_source))
 {
 }
 
@@ -45,6 +46,7 @@ auto server::operator=(server&& other) -> server&
         m_tls_ctx       = std::move(other.m_tls_ctx);
         m_options       = std::move(other.m_options);
         m_accept_socket = std::move(other.m_accept_socket);
+        m_stop_source   = std::move(other.m_stop_source);
     }
     return *this;
 }

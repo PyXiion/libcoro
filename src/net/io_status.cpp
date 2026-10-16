@@ -1,5 +1,7 @@
 #include "coro/net/io_status.hpp"
 #include "coro/platform.hpp"
+#include <cerrno>
+#include <cstdio>
 #include <system_error>
 
 #if defined(CORO_PLATFORM_WINDOWS)
@@ -131,25 +133,6 @@ auto coro::net::make_io_status_from_native(int native_code) -> coro::net::io_sta
     return coro::net::io_status{.type = type, .native_code = native_code};
 #endif
 }
-auto coro::net::make_io_status_from_poll_status(coro::poll_status status) -> coro::net::io_status
-{
-    switch (status)
-    {
-        case poll_status::read:
-        case poll_status::write:
-            return io_status{io_status::kind::ok};
-        case poll_status::timeout:
-            return io_status{io_status::kind::timeout};
-        case poll_status::error:
-            return io_status{io_status::kind::polling_error};
-        case poll_status::closed:
-            return io_status{io_status::kind::closed};
-        case poll_status::cancelled:
-            return io_status{io_status::kind::cancelled};
-        default:
-            return io_status{io_status::kind::unknown};
-    }
-}
 
 auto coro::net::to_string(coro::net::io_status::kind k) -> std::string_view
 {
@@ -168,8 +151,6 @@ auto coro::net::to_string(coro::net::io_status::kind k) -> std::string_view
             return "Operation timed out";
         case kind::would_block_or_try_again:
             return "Operation would block or try again";
-        case kind::polling_error:
-            return "Polling error";
         case kind::cancelled:
             return "Operation cancelled";
         case kind::udp_not_bound:

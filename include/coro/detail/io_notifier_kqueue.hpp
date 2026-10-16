@@ -10,7 +10,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "coro/detail/poll_info.hpp"
+#include "coro/detail/async_operation.hpp"
 #include "coro/fd.hpp"
 #include "coro/poll.hpp"
 
@@ -50,19 +50,20 @@ public:
 
     auto watch(fd_t fd, poll_op op, void* data, bool keep = false) -> bool;
 
-    auto watch(poll_info& pi) -> bool;
+    static auto try_now(async_operation& op) -> bool;
+    auto        submit(async_operation& op) -> bool;
+    auto        complete_ready(async_operation& op, poll_status status) -> bool;
+    auto        cancel(async_operation& op) -> void;
 
     auto unwatch(fd_t fd, poll_op op) -> bool;
-
-    auto unwatch(poll_info& pi) -> bool;
 
     auto unwatch_timer(const timer_handle& timer) -> bool;
 
     /// Wakes a concurrent or subsequent next_events() call. Concurrent wakeups may coalesce.
     auto wake() -> void;
 
-    auto next_events(std::vector<std::pair<poll_info*, poll_status>>& ready_events, std::chrono::milliseconds timeout)
-        -> void;
+    auto next_events(
+        std::vector<std::pair<async_operation*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void;
 
     auto native_handle() const -> fd_t { return m_fd; }
 };

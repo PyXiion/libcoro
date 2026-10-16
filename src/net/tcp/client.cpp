@@ -1,7 +1,5 @@
 #include "coro/net/tcp/client.hpp"
 
-#include <iostream>
-
 namespace coro::net::tcp
 {
 using namespace std::chrono_literals;
@@ -74,7 +72,7 @@ auto client::operator=(client&& other) noexcept -> client&
     return *this;
 }
 
-auto client::connect(std::chrono::milliseconds timeout) -> coro::task<connect_status>
+auto client::connect(std::chrono::milliseconds timeout, std::stop_token stop_token) -> coro::task<connect_status>
 {
     // Only allow the user to connect per tcp client once, if they need to re-connect they should
     // make a new tcp::client.
@@ -83,49 +81,22 @@ auto client::connect(std::chrono::milliseconds timeout) -> coro::task<connect_st
         co_return m_connect_status.value();
     }
 
-    // This enforces the connection status is aways set on the client object upon returning.
-    auto return_value = [this](connect_status s) -> connect_status
+    auto status = co_await m_scheduler->connect(m_socket, m_endpoint, timeout, stop_token);
+    switch (status.type)
     {
-        m_connect_status = s;
-        return s;
-    };
-
-    auto [sockaddr, len] = m_endpoint.data();
-
-    auto cret = ::connect(m_socket.native_handle(), sockaddr, len);
-    if (cret == 0)
-    {
-        co_return return_value(connect_status::connected);
-    }
-    else if (cret == -1)
-    {
-        // If the connect is happening in the background poll for write on the socket to trigger
-        // when the connection is established.
-        if (errno == EAGAIN || errno == EINPROGRESS)
-        {
-            auto pstatus = co_await m_scheduler->poll(m_socket, poll_op::write, timeout);
-            if (pstatus == poll_status::write)
-            {
-                int       result{0};
-                socklen_t result_length{sizeof(result)};
-                if (getsockopt(m_socket.native_handle(), SOL_SOCKET, SO_ERROR, &result, &result_length) < 0)
-                {
-                    std::cerr << "connect failed to getsockopt after write poll event\n";
-                }
-
-                if (result == 0)
-                {
-                    co_return return_value(connect_status::connected);
-                }
-            }
-            else if (pstatus == poll_status::timeout)
-            {
-                co_return return_value(connect_status::timeout);
-            }
-        }
+        case io_status::kind::ok:
+            m_connect_status = connect_status::connected;
+            break;
+        case io_status::kind::timeout:
+            m_connect_status = connect_status::timeout;
+            break;
+        case io_status::kind::connection_refused:
+        default:
+            m_connect_status = connect_status::error;
+            break;
     }
 
-    co_return return_value(connect_status::error);
+    co_return m_connect_status.value();
 }
 
 } // namespace coro::net::tcp

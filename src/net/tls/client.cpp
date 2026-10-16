@@ -111,7 +111,7 @@ auto client::connect(std::chrono::milliseconds timeout) -> coro::task<connection
         // when the connection is established.
         if (errno == EAGAIN || errno == EINPROGRESS)
         {
-            auto pstatus = co_await m_scheduler->poll(m_socket, poll_op::write, timeout);
+            auto pstatus = co_await m_scheduler->poll(m_socket.native_handle(), poll_op::write, timeout);
             if (pstatus == poll_status::write)
             {
                 int       result{0};
@@ -184,7 +184,7 @@ auto client::handshake(std::chrono::milliseconds timeout) -> coro::task<connecti
         }
 
         // TODO: adjust timeout based on elapsed time so far.
-        auto pstatus = co_await m_scheduler->poll(m_socket, op, timeout);
+        auto pstatus = co_await m_scheduler->poll(m_socket.native_handle(), op, timeout);
         switch (pstatus)
         {
             case poll_status::timeout:
@@ -233,7 +233,7 @@ auto client::tls_shutdown_and_free(std::chrono::milliseconds timeout) -> coro::t
                 co_return;
             }
 
-            auto pstatus = co_await m_scheduler->poll(m_socket, op, timeout);
+            auto pstatus = co_await m_scheduler->poll(m_socket.native_handle(), op, timeout);
             switch (pstatus)
             {
                 case poll_status::timeout:

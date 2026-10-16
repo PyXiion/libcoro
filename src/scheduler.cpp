@@ -89,58 +89,21 @@ auto scheduler::schedule_at(time_point time) -> coro::task<void>
 auto scheduler::yield_until(time_point time) -> coro::task<void>
 {
     auto now = clock::now();
-
-    // If the requested time is in the past (or now!) bail out!
     if (time <= now)
     {
         co_await schedule();
     }
     else
     {
-        m_size.fetch_add(1, std::memory_order::release);
-
-        auto amount = std::chrono::duration_cast<std::chrono::milliseconds>(time - now);
-
-        detail::poll_info pi{};
-        add_timer_token(now + amount, pi);
-        co_await pi;
+        co_await operation<detail::async_op_kind::timer>{
+            *this, net::invalid_native_handle, nullptr, 0, nullptr, time - now, {}};
     }
-    co_return;
 }
 
-auto scheduler::poll(
-    fd_t                           fd,
-    coro::poll_op                  op,
-    std::chrono::milliseconds      timeout,
-    std::optional<poll_stop_token> cancel_trigger) -> coro::task<poll_status>
+auto scheduler::poll(fd_t fd, coro::poll_op op, std::chrono::milliseconds timeout, std::stop_token stop)
+    -> coro::task<poll_status>
 {
-    // Because the size will drop when this coroutine suspends every poll needs to undo the subtraction
-    // on the number of active tasks in the scheduler.  When this task is resumed by the event loop.
-    m_size.fetch_add(1, std::memory_order::release);
-
-    // Setup two events, a timeout event and the actual poll for op event.
-    // Whichever triggers first will delete the other to guarantee only one wins.
-    // The resume token will be set by the scheduler to what the event turned out to be.
-
-    bool timeout_requested = (timeout > 0ms);
-
-    auto pi = detail::poll_info{fd, op, cancel_trigger};
-
-    if (timeout_requested)
-    {
-        pi.m_timer_pos = add_timer_token(clock::now() + timeout, pi);
-    }
-
-    if (!m_io_notifier.watch(pi))
-    {
-        std::cerr << "Failed to add " << fd << " to watch list\n";
-    }
-
-    // The event loop will 'clean-up' whichever event didn't win since the coroutine is scheduled
-    // onto the thread poll its possible the other type of event could trigger while its waiting
-    // to execute again, thus restarting the coroutine twice, that would be quite bad.
-    auto result = co_await pi;
-    co_return result;
+    co_return co_await operation<detail::async_op_kind::poll>{*this, fd, nullptr, 0, nullptr, timeout, stop, op};
 }
 
 auto scheduler::resume(std::coroutine_handle<> handle) -> bool
@@ -190,26 +153,15 @@ auto scheduler::shutdown() noexcept -> void
 
 auto scheduler::yield_for_internal(std::chrono::nanoseconds amount) -> coro::task<void>
 {
-    if (amount <= 0ms)
+    if (amount <= 0ns)
     {
         co_await schedule();
     }
     else
     {
-        // Yield/timeout tasks are considered live in the scheduler and must be accounted for. Note
-        // that if the user gives an invalid amount and schedule() is directly called it will account
-        // for the scheduled task there.
-        m_size.fetch_add(1, std::memory_order::release);
-
-        // Yielding does not require setting the timer position on the poll info since
-        // it doesn't have a corresponding 'event' that can trigger, it always waits for
-        // the timeout to occur before resuming.
-
-        detail::poll_info pi{};
-        add_timer_token(clock::now() + amount, pi);
-        co_await pi;
+        co_await operation<detail::async_op_kind::timer>{
+            *this, net::invalid_native_handle, nullptr, 0, nullptr, amount, {}};
     }
-    co_return;
 }
 
 auto scheduler::process_events_manual(std::chrono::milliseconds timeout) -> void
@@ -249,30 +201,39 @@ auto scheduler::process_events_execute(std::chrono::milliseconds timeout) -> voi
     m_recent_events.clear();
     m_io_notifier.next_events(m_recent_events, timeout);
 
-    for (auto& [handle_ptr, poll_status] : m_recent_events)
     {
-        if (handle_ptr == m_timer_ptr)
+        std::scoped_lock lock{m_publication_mutex};
+        for (auto& [op, status] : m_recent_events)
         {
-            // Process all events that have timed out.
-            process_timeout_execute();
-        }
-        else if (handle_ptr == ::coro::io_notifier::wake_tag)
-        {
-            // Process scheduled coroutines.
-            process_scheduled_execute_inline();
-        }
-        else
-        {
-            // Individual poll task wake-up.
-            process_event_execute(static_cast<detail::poll_info*>(handle_ptr), poll_status);
+            if (op == m_timer_ptr)
+            {
+                process_timeout_execute();
+            }
+            else if (op == ::coro::io_notifier::wake_tag)
+            {
+                process_scheduled_execute_inline();
+                process_cancel_requests();
+            }
+            else if (!(op->m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed))
+            {
+                if (m_io_notifier.complete_ready(*op, status))
+                {
+                    mark_completed(*op);
+                }
+            }
         }
     }
 
-    // Its important to not resume any handles until the full set is accounted for.  If a timeout
-    // and an event for the same handle happen in the same epoll_wait() call then inline processing
-    // will destruct the poll_info object before the second event is handled.  This is also possible
-    // with thread pool processing, but probably has an extremely low chance of occuring due to
-    // the thread switch required.  If m_max_events == 1 this would be unnecessary.
+    // Finish only after dispatch, so duplicate entries in this batch cannot outlive their operation.
+    for (auto* op : m_ops_to_finish)
+    {
+        auto previous = op->m_state.fetch_or(detail::async_operation::state_finished, std::memory_order::acq_rel);
+        if (previous & detail::async_operation::state_suspended)
+        {
+            m_handles_to_resume.emplace_back(op->m_awaiting_coroutine);
+        }
+    }
+    m_ops_to_finish.clear();
 
     if (!m_handles_to_resume.empty())
     {
@@ -326,116 +287,120 @@ auto scheduler::process_scheduled_execute_inline() -> void
     }
 }
 
-auto scheduler::process_event_execute(detail::poll_info* pi, poll_status status) -> void
+auto scheduler::request_cancel(detail::async_operation& op) noexcept -> void
 {
-    if (!pi->m_processed)
+    auto previous = op.m_state.fetch_or(detail::async_operation::state_cancel_queued, std::memory_order::acq_rel);
+    if (previous & (detail::async_operation::state_cancel_queued | detail::async_operation::state_completed))
     {
-        std::atomic_thread_fence(std::memory_order::acquire);
-        // Its possible the event and the timeout occurred in the same epoll, make sure only one
-        // is ever processed, the other is discarded.
-        pi->m_processed = true;
+        return;
+    }
+    detail::awaiter_list_push(m_cancel_requests, &op);
+    m_io_notifier.wake();
+}
 
-        // Given a valid fd always remove it from epoll so the next poll can blindly EPOLL_CTL_ADD.
-        if (pi->m_fd != -1)
+auto scheduler::process_cancel_requests() -> void
+{
+    auto* ops = detail::awaiter_list_pop_all(m_cancel_requests);
+    while (ops != nullptr)
+    {
+        auto* next = ops->m_next;
+        if (ops->m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed)
         {
-            m_io_notifier.unwatch(*pi);
+            m_ops_to_finish.emplace_back(ops);
         }
-
-        // Since this event triggered, remove its corresponding timeout if it has one.
-        if (pi->m_timer_pos.has_value())
+        else
         {
-            remove_timer_token(pi->m_timer_pos.value());
+            abort_op(
+                *ops,
+                ops->m_submit_error != 0 ? net::make_io_status_from_native(ops->m_submit_error)
+                                         : net::io_status{net::io_status::kind::cancelled});
+            m_ops_to_finish.emplace_back(ops);
         }
+        ops = next;
+    }
+}
 
-        pi->m_poll_status = status;
-
-        while (pi->m_awaiting_coroutine == nullptr)
+auto scheduler::abort_op(detail::async_operation& op, net::io_status status) -> void
+{
+    if (op.m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed)
+    {
+        return;
+    }
+    if (op.m_kind != detail::async_op_kind::timer)
+    {
+        m_io_notifier.cancel(op);
+    }
+    op.m_status = status;
+    if (op.m_kind == detail::async_op_kind::poll)
+    {
+        switch (status.type)
         {
-            std::atomic_thread_fence(std::memory_order::acquire);
+            case net::io_status::kind::timeout:
+                op.m_poll_status = poll_status::timeout;
+                break;
+            case net::io_status::kind::cancelled:
+                op.m_poll_status = poll_status::cancelled;
+                break;
+            default:
+                op.m_poll_status = poll_status::error;
+                break;
         }
+    }
+    mark_completed(op);
+}
 
-        m_handles_to_resume.emplace_back(pi->m_awaiting_coroutine);
+auto scheduler::mark_completed(detail::async_operation& op) -> void
+{
+    remove_timer_token(op);
+    auto previous = op.m_state.fetch_or(detail::async_operation::state_completed, std::memory_order::acq_rel);
+    if (!(previous & detail::async_operation::state_cancel_queued))
+    {
+        m_ops_to_finish.emplace_back(&op);
     }
 }
 
 auto scheduler::process_timeout_execute() -> void
 {
-    std::vector<detail::poll_info*> poll_infos{};
-    auto                            now = clock::now();
-
+    std::vector<detail::async_operation*> expired;
     {
-        std::scoped_lock lk{m_timed_events_mutex};
-        while (!m_timed_events.empty())
+        std::scoped_lock lock{m_timed_events_mutex};
+        auto             now = clock::now();
+        while (!m_timed_events.empty() && m_timed_events.begin()->first <= now)
         {
-            auto first    = m_timed_events.begin();
-            auto [tp, pi] = *first;
-
-            if (tp <= now)
-            {
-                m_timed_events.erase(first);
-                poll_infos.emplace_back(pi);
-            }
-            else
-            {
-                break;
-            }
+            auto  first = m_timed_events.begin();
+            auto* op    = first->second;
+            op->m_timer_pos.reset();
+            m_timed_events.erase(first);
+            expired.emplace_back(op);
         }
+        update_timeout(clock::now());
     }
-
-    for (auto pi : poll_infos)
+    for (auto* op : expired)
     {
-        if (!pi->m_processed)
-        {
-            // Its possible the event and the timeout occurred in the same epoll, make sure only one
-            // is ever processed, the other is discarded.
-            pi->m_processed = true;
-
-            // Since this timed out, remove its corresponding event if it has one.
-            if (pi->m_fd != -1)
-            {
-                m_io_notifier.unwatch(*pi);
-            }
-
-            while (pi->m_awaiting_coroutine == nullptr)
-            {
-                std::atomic_thread_fence(std::memory_order::acquire);
-            }
-
-            m_handles_to_resume.emplace_back(pi->m_awaiting_coroutine);
-            pi->m_poll_status = coro::poll_status::timeout;
-        }
+        abort_op(
+            *op,
+            {op->m_kind == detail::async_op_kind::timer ? net::io_status::kind::ok : net::io_status::kind::timeout});
     }
-
-    // Update the time to the next smallest time point, re-take the current now time
-    // since updating and resuming tasks could shift the time.
-    update_timeout(clock::now());
 }
 
-auto scheduler::add_timer_token(time_point tp, detail::poll_info& pi) -> timed_events::iterator
+auto scheduler::add_timer_token(time_point tp, detail::async_operation& op) -> void
 {
-    std::scoped_lock lk{m_timed_events_mutex};
-    auto             pos = m_timed_events.emplace(tp, &pi);
-
-    // If this item was inserted as the smallest time point, update the timeout.
-    if (pos == m_timed_events.begin())
+    std::scoped_lock lock{m_timed_events_mutex};
+    op.m_timer_pos = m_timed_events.emplace(tp, &op);
+    if (*op.m_timer_pos == m_timed_events.begin())
     {
         update_timeout(clock::now());
     }
-
-    return pos;
 }
 
-auto scheduler::remove_timer_token(timed_events::iterator pos) -> void
+auto scheduler::remove_timer_token(detail::async_operation& op) -> void
 {
+    std::scoped_lock lock{m_timed_events_mutex};
+    if (op.m_timer_pos)
     {
-        std::scoped_lock lk{m_timed_events_mutex};
-        auto             is_first = (m_timed_events.begin() == pos);
-
-        m_timed_events.erase(pos);
-
-        // If this was the first item, update the timeout.  It would be acceptable to just let it
-        // also fire the timeout as the event loop will ignore it since nothing will have timed
-        // out but it feels like the right thing to do to update it to the correct timeout value.
+        auto is_first = *op.m_timer_pos == m_timed_events.begin();
+        m_timed_events.erase(*op.m_timer_pos);
+        op.m_timer_pos.reset();
         if (is_first)
         {
             update_timeout(clock::now());

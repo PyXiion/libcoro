@@ -1,5 +1,6 @@
 #include "coro/detail/io_notifier_epoll.hpp"
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -9,7 +10,7 @@
 
 #include <sys/eventfd.h>
 
-#include "coro/detail/poll_info.hpp"
+#include "coro/detail/async_operation.hpp"
 #include "coro/detail/timer_handle.hpp"
 #include "coro/fd.hpp"
 #include "coro/platform.hpp"
@@ -32,34 +33,6 @@ static auto poll_op_to_events(poll_op op) -> uint32_t
         events |= EPOLLOUT;
     }
     return events;
-}
-
-/**
- * Encode the state needed to rewind the correct poll info after an event occured into the user data of an epoll event.
- *
- * We need a pointer to the poll_info awaitable to resume the awaiting coroutine. Additionally we need to know if the
- * captured event came from the file descriptor of the poll_info, in which case we want to decode the poll_status from
- * the event, or from a registered cancellation token, in which case we want to return a cancelled poll status.
- */
-auto encode_udata(bool keep_registered, bool is_cancel_event, void* udata) -> uint64_t
-{
-    // Pointers on 64 bit unix machines take up to 48 bit right now. So we have some bits left to encode the boolean to
-    // indicate if this is a cancellation event descriptor at the highest bit.
-    return (((uint64_t)keep_registered) << 63) | (((uint64_t)is_cancel_event) << 62) |
-           (reinterpret_cast<uintptr_t>(udata) & 0x3FFFFFFFFFFFFFFFULL);
-}
-
-/**
- * Decode the state that was encoded into the epoll events user data field.
- *
- * For details see documentation of `coro::detail::encode_udata(bool, bool, void*)` above.
- */
-auto decode_udata(uint64_t encoded) -> std::tuple<bool, bool, void*>
-{
-    bool  keep_registered = (bool)(encoded >> 63);
-    bool  is_cancel_event = (bool)((encoded >> 62) & 0x1);
-    void* udata           = reinterpret_cast<void*>(encoded & 0xFFFFFFFFFFFFULL);
-    return std::make_tuple(keep_registered, is_cancel_event, udata);
 }
 
 io_notifier_epoll::io_notifier_epoll() : m_fd{::epoll_create1(EPOLL_CLOEXEC)}
@@ -135,46 +108,63 @@ auto io_notifier_epoll::watch_timer(const timer_handle& timer, std::chrono::nano
     return ::timerfd_settime(timer.get_fd(), 0, &ts, nullptr) != -1;
 }
 
-auto io_notifier_epoll::watch(fd_t fd, poll_op op, void* data, bool keep, bool is_cancel_event) -> bool
+auto io_notifier_epoll::watch(fd_t fd, poll_op op, void* data, bool keep) -> bool
 {
     auto event_data     = event_t{};
-    event_data.events   = poll_op_to_events(op) | EPOLLRDHUP;
-    event_data.data.u64 = encode_udata(keep, is_cancel_event, data);
-
-    if (!keep)
-    {
-        event_data.events |= EPOLLONESHOT;
-    }
-    else
-    {
-        // For events being kept in a scheduler they need to be edge triggered or they'll constantly wake-up the event
-        // loop.
-        event_data.events |= EPOLLET;
-    }
-
+    event_data.events   = poll_op_to_events(op) | EPOLLRDHUP | (keep ? EPOLLET : EPOLLONESHOT);
+    event_data.data.ptr = data;
     return ::epoll_ctl(m_fd, EPOLL_CTL_ADD, fd, &event_data) != -1;
 }
 
-auto io_notifier_epoll::watch(poll_info& pi) -> bool
+auto io_notifier_epoll::try_now(async_operation& op) -> bool
 {
-    watch(pi.m_fd, pi.m_op, static_cast<void*>(&pi), false, false);
+    return perform_posix(op);
+}
 
-    if (pi.m_cancel_trigger.has_value())
+auto io_notifier_epoll::submit(async_operation& op) -> bool
+{
+    if (!watch(op.m_fd, operation_poll_op(op), &op))
     {
-        watch(pi.m_cancel_trigger.value().native_handle(), poll_op::read, static_cast<void*>(&pi), false, true);
+        op.m_submit_error = errno;
+        return false;
     }
-
+    op.m_registered = true;
     return true;
+}
+
+auto io_notifier_epoll::complete_ready(async_operation& op, poll_status status) -> bool
+{
+    if (op.m_kind == async_op_kind::poll)
+    {
+        op.m_poll_status = status;
+    }
+    else if (!perform_posix(op))
+    {
+        auto event_data     = event_t{};
+        event_data.events   = poll_op_to_events(operation_poll_op(op)) | EPOLLONESHOT | EPOLLRDHUP;
+        event_data.data.ptr = &op;
+        if (::epoll_ctl(m_fd, EPOLL_CTL_MOD, op.m_fd, &event_data) != -1)
+        {
+            return false;
+        }
+        op.m_status = net::make_io_status_from_native(errno);
+    }
+    cancel(op);
+    return true;
+}
+
+auto io_notifier_epoll::cancel(async_operation& op) -> void
+{
+    if (op.m_registered)
+    {
+        unwatch(op.m_fd, operation_poll_op(op));
+        op.m_registered = false;
+    }
 }
 
 auto io_notifier_epoll::unwatch(fd_t fd, poll_op) -> bool
 {
     return ::epoll_ctl(m_fd, EPOLL_CTL_DEL, fd, nullptr) != -1;
-}
-
-auto io_notifier_epoll::unwatch(poll_info& pi) -> bool
-{
-    return unwatch(pi.m_fd, pi.m_op);
 }
 
 auto io_notifier_epoll::unwatch_timer(const timer_handle& timer) -> bool
@@ -187,40 +177,19 @@ auto io_notifier_epoll::unwatch_timer(const timer_handle& timer) -> bool
 }
 
 auto io_notifier_epoll::next_events(
-    std::vector<std::pair<poll_info*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
+    std::vector<std::pair<async_operation*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
 {
     auto ready_set = std::array<event_t, m_max_events>{};
     int  num_ready = ::epoll_wait(m_fd, ready_set.data(), ready_set.size(), timeout.count());
     for (int i = 0; i < num_ready; ++i)
     {
-        auto [keep_registered, is_cancel_event, udata] = decode_udata(ready_set[i].data.u64);
-        if (udata == wake_tag)
+        auto* data = ready_set[i].data.ptr;
+        if (data == wake_tag)
         {
             uint64_t value;
             ::read(m_wake_fd, &value, sizeof(value));
-            ready_events.emplace_back(static_cast<poll_info*>(const_cast<void*>(wake_tag)), poll_status::read);
-            continue;
         }
-        auto* pi = static_cast<poll_info*>(udata);
-
-        // If the event issuing fd is the same as the fd of the cancellation trigger of the registered poll_info we
-        // this operation was cancelled by the user.
-        if (is_cancel_event)
-        {
-            ready_events.emplace_back(pi, poll_status::cancelled);
-            if (!keep_registered)
-            {
-                unwatch(*pi);
-            }
-        }
-        else
-        {
-            ready_events.emplace_back(pi, io_notifier_epoll::event_to_poll_status(ready_set[i]));
-            if (!keep_registered && pi->m_cancel_trigger.has_value())
-            {
-                unwatch(pi->m_cancel_trigger.value().native_handle(), poll_op::read);
-            }
-        }
+        ready_events.emplace_back(static_cast<async_operation*>(data), event_to_poll_status(ready_set[i]));
     }
 }
 

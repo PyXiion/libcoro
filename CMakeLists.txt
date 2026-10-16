@@ -40,7 +40,7 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     link_libraries(-lc++)
 endif()
 
-if(UNIX AND NOT APPLE)
+if(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
     set(LINUX TRUE)
 endif()
 
@@ -143,8 +143,7 @@ set(LIBCORO_SOURCE_FILES
 
 if(LIBCORO_FEATURE_NETWORKING)
     list(APPEND LIBCORO_SOURCE_FILES
-        include/coro/detail/pipe.hpp src/detail/pipe.cpp
-        include/coro/detail/poll_info.hpp
+        include/coro/detail/async_operation.hpp
         include/coro/detail/timer_handle.hpp src/detail/timer_handle.cpp
 
         include/coro/platform.hpp
@@ -157,11 +156,13 @@ if(LIBCORO_FEATURE_NETWORKING)
     if(LINUX)
         list(APPEND LIBCORO_SOURCE_FILES
             include/coro/detail/io_notifier_epoll.hpp src/detail/io_notifier_epoll.cpp
+            src/detail/async_operation_posix.cpp
         )
     endif()
-    if(MACOSX)
+    if(MACOSX OR CMAKE_SYSTEM_NAME MATCHES "FreeBSD|OpenBSD|NetBSD|DragonFly")
         list(APPEND LIBCORO_SOURCE_FILES
             include/coro/detail/io_notifier_kqueue.hpp src/detail/io_notifier_kqueue.cpp
+            src/detail/async_operation_posix.cpp
         )
     endif()
 

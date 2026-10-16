@@ -1,17 +1,17 @@
 #include "catch_amalgamated.hpp"
 
 #include <coro/coro.hpp>
-#include <coro/fd.hpp>
+#include <coro/net/socket.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <iostream>
+#include <stop_token>
 #include <thread>
 
-#include <cstring>
 #include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 TEST_CASE("scheduler", "[scheduler]")
 {
@@ -19,7 +19,19 @@ TEST_CASE("scheduler", "[scheduler]")
 }
 
 using namespace std::chrono_literals;
-using coro::fd_t;
+
+namespace
+{
+auto make_socket_pair() -> std::array<coro::net::socket, 2>
+{
+    std::array<int, 2> handles{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, handles.data()) == 0);
+    auto sockets = std::array{coro::net::socket{handles[0]}, coro::net::socket{handles[1]}};
+    REQUIRE(sockets[0].blocking(coro::net::socket::blocking_t::no));
+    REQUIRE(sockets[1].blocking(coro::net::socket::blocking_t::no));
+    return sockets;
+}
+} // namespace
 
 TEST_CASE("scheduler schedule single task", "[scheduler]")
 {
@@ -112,99 +124,163 @@ TEST_CASE("scheduler task with multiple events", "[scheduler]")
     REQUIRE(s->empty());
 }
 
-TEST_CASE("scheduler task with read poll", "[scheduler]")
+TEST_CASE("scheduler task with read completion", "[scheduler]")
 {
-    auto trigger_fds = std::array<fd_t, 2>{};
-    REQUIRE(::pipe(trigger_fds.data()) == 0);
+    auto sockets = make_socket_pair();
     auto s =
         coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
 
-    auto make_poll_read_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_read_task = [&]() -> coro::task<void>
     {
         co_await s->schedule();
-        auto status = co_await s->poll(trigger_fd, coro::poll_op::read);
-        REQUIRE(status == coro::poll_status::read);
-        co_return;
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == std::byte{42});
     };
 
-    auto make_poll_write_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_write_task = [&]() -> coro::task<void>
     {
         co_await s->schedule();
-        uint64_t value{42};
-        auto     unused = write(trigger_fd, &value, sizeof(value));
-        (void)unused;
-        co_return;
+        const auto buffer    = std::array{std::byte{42}};
+        auto [status, bytes] = co_await s->write_some(sockets[1], buffer);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
     };
 
-    coro::sync_wait(coro::when_all(make_poll_read_task(s, trigger_fds[0]), make_poll_write_task(s, trigger_fds[1])));
-
-    std::cerr << "scheduler.size() before shutdown = " << s->size() << "\n";
+    coro::sync_wait(coro::when_all(make_read_task(), make_write_task()));
     s->shutdown();
-    std::cerr << "scheduler.size() after shutdown = " << s->size() << "\n";
     REQUIRE(s->empty());
-    close(trigger_fds[0]);
-    close(trigger_fds[1]);
 }
 
-TEST_CASE("scheduler task with read poll with timeout", "[scheduler]")
+TEST_CASE("scheduler task with read completion before timeout", "[scheduler]")
 {
-    auto trigger_fds = std::array<fd_t, 2>{};
-    REQUIRE(::pipe(trigger_fds.data()) == 0);
+    auto sockets = make_socket_pair();
     auto s =
         coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
 
-    auto make_poll_read_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_read_task = [&]() -> coro::task<void>
     {
-        co_await s->schedule();
-        // Poll with a timeout but don't timeout.
-        auto status = co_await s->poll(trigger_fd, coro::poll_op::read, 50ms);
-        REQUIRE(status == coro::poll_status::read);
-        co_return;
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == std::byte{42});
     };
 
-    auto make_poll_write_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_write_task = [&]() -> coro::task<void>
     {
         co_await s->schedule();
-        uint64_t value{42};
-        auto     unused = write(trigger_fd, &value, sizeof(value));
-        (void)unused;
-        co_return;
+        const auto buffer    = std::array{std::byte{42}};
+        auto [status, bytes] = co_await s->write_some(sockets[1], buffer);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
     };
 
-    coro::sync_wait(coro::when_all(make_poll_read_task(s, trigger_fds[0]), make_poll_write_task(s, trigger_fds[1])));
-
-    std::cerr << "scheduler.size() before shutdown = " << s->size() << "\n";
+    auto read_task = make_read_task();
+    read_task.resume();
+    REQUIRE_FALSE(read_task.is_ready());
+    coro::sync_wait(make_write_task());
     s->shutdown();
-    std::cerr << "scheduler.size() after shutdown = " << s->size() << "\n";
     REQUIRE(s->empty());
-    close(trigger_fds[0]);
-    close(trigger_fds[1]);
+    REQUIRE(read_task.is_ready());
+    coro::sync_wait(read_task);
 }
 
-TEST_CASE("scheduler task with read poll timeout", "[scheduler]")
+TEST_CASE("scheduler task with read timeout", "[scheduler]")
 {
-    auto trigger_fds = std::array<fd_t, 2>{};
-    REQUIRE(::pipe(trigger_fds.data()) == 0);
+    auto sockets = make_socket_pair();
     auto s =
         coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
 
-    auto make_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_task = [&]() -> coro::task<void>
     {
         co_await s->schedule();
-        // Poll with a timeout and timeout.
-        auto status = co_await s->poll(trigger_fd, coro::poll_op::read, 10ms);
-        REQUIRE(status == coro::poll_status::timeout);
-        co_return;
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 10ms);
+        REQUIRE(status.is_timeout());
+        REQUIRE(bytes == 0);
     };
 
-    coro::sync_wait(make_task(s, trigger_fds[0]));
-
-    std::cerr << "scheduler.size() before shutdown = " << s->size() << "\n";
+    coro::sync_wait(make_task());
     s->shutdown();
-    std::cerr << "scheduler.size() after shutdown = " << s->size() << "\n";
     REQUIRE(s->empty());
-    close(trigger_fds[0]);
-    close(trigger_fds[1]);
+}
+
+TEST_CASE("scheduler pending read cancellation", "[scheduler]")
+{
+    auto sockets  = make_socket_pair();
+    auto strategy = GENERATE(
+        coro::scheduler::execution_strategy_t::process_tasks_inline,
+        coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool);
+    auto s = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
+            .pool               = coro::thread_pool::options{.thread_count = 1},
+            .execution_strategy = strategy});
+    std::stop_source stop_source;
+
+    auto make_read_task = [&]() -> coro::task<void>
+    {
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s, stop_source.get_token());
+        REQUIRE(status.type == coro::net::io_status::kind::cancelled);
+        REQUIRE(bytes == 0);
+    };
+    auto make_cancel_task = [&]() -> coro::task<void>
+    {
+        co_await s->schedule();
+        REQUIRE(stop_source.request_stop());
+    };
+
+    auto read_task = make_read_task();
+    read_task.resume();
+    REQUIRE_FALSE(read_task.is_ready());
+    REQUIRE(s->size() == 1);
+    REQUIRE_FALSE(s->empty());
+
+    auto cancel_task = make_cancel_task();
+    cancel_task.resume();
+    while (s->process_events(100ms) > 0) {}
+    s->shutdown();
+    REQUIRE(s->empty());
+    REQUIRE(read_task.is_ready());
+    REQUIRE(cancel_task.is_ready());
+    coro::sync_wait(read_task);
+    coro::sync_wait(cancel_task);
+}
+
+TEST_CASE("scheduler pre-cancelled read preserves later data", "[scheduler]")
+{
+    auto sockets = make_socket_pair();
+    auto s =
+        coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
+    std::stop_source stop_source;
+    REQUIRE(stop_source.request_stop());
+
+    auto make_task = [&]() -> coro::task<void>
+    {
+        co_await s->schedule();
+        std::array<std::byte, 1> buffer{};
+        auto [cancel_status, cancel_bytes] = co_await s->read_some(sockets[0], buffer, 5s, stop_source.get_token());
+        REQUIRE(cancel_status.type == coro::net::io_status::kind::cancelled);
+        REQUIRE(cancel_bytes == 0);
+
+        const auto value             = std::array{std::byte{42}};
+        auto [write_status, written] = co_await s->write_some(sockets[1], value);
+        REQUIRE(write_status.is_ok());
+        REQUIRE(written == 1);
+
+        auto [read_status, bytes] = co_await s->read_some(sockets[0], buffer, 5s);
+        REQUIRE(read_status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == value[0]);
+    };
+
+    coro::sync_wait(make_task());
+    s->shutdown();
+    REQUIRE(s->empty());
 }
 
 TEST_CASE("scheduler separate thread resume", "[scheduler]")
@@ -645,118 +721,86 @@ TEST_CASE("scheduler self generating coroutine (stack overflow check)", "[schedu
 
 TEST_CASE("scheduler manual process events thread pool", "[scheduler]")
 {
-    auto trigger_fds = std::array<fd_t, 2>{};
-    REQUIRE(::pipe(trigger_fds.data()) == 0);
-    auto s = coro::scheduler::make_unique(coro::scheduler::options{
-        .thread_strategy = coro::scheduler::thread_strategy_t::manual,
-        .pool            = coro::thread_pool::options{
-                       .thread_count = 1,
-        }});
+    auto sockets = make_socket_pair();
+    auto s       = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .thread_strategy = coro::scheduler::thread_strategy_t::manual,
+            .pool            = coro::thread_pool::options{.thread_count = 1}});
 
-    std::atomic<bool> polling{false};
-
-    auto make_poll_read_task =
-        [](std::unique_ptr<coro::scheduler>& s, std::atomic<bool>& polling, int trigger_fd) -> coro::task<void>
+    auto make_read_task = [&]() -> coro::task<void>
     {
-        std::cerr << "poll task start s.size() == " << s->size() << "\n";
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == std::byte{42});
+    };
+    auto make_write_task = [&]() -> coro::task<void>
+    {
         co_await s->schedule();
-        polling = true;
-        std::cerr << "poll task polling s.size() == " << s->size() << "\n";
-        auto status = co_await s->poll(trigger_fd, coro::poll_op::read);
-        REQUIRE(status == coro::poll_status::read);
-        std::cerr << "poll task exiting s.size() == " << s->size() << "\n";
-        co_return;
+        const auto buffer    = std::array{std::byte{42}};
+        auto [status, bytes] = co_await s->write_some(sockets[1], buffer);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
     };
 
-    auto make_poll_write_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
-    {
-        std::cerr << "write task start s.size() == " << s->size() << "\n";
-        co_await s->schedule();
-        uint64_t value{42};
-        std::cerr << "write task writing s.size() == " << s->size() << "\n";
-        auto unused = write(trigger_fd, &value, sizeof(value));
-        (void)unused;
-        std::cerr << "write task exiting s.size() == " << s->size() << "\n";
-        co_return;
-    };
+    auto read_task = make_read_task();
+    read_task.resume();
+    REQUIRE_FALSE(read_task.is_ready());
+    REQUIRE(s->size() == 1);
+    REQUIRE_FALSE(s->empty());
 
-    auto poll_task  = make_poll_read_task(s, polling, trigger_fds[0]);
-    auto write_task = make_poll_write_task(s, trigger_fds[1]);
-
-    poll_task.resume(); // get to co_await s.poll();
-    while (!polling)
-    {
-        std::this_thread::sleep_for(10ms);
-    }
-
+    auto write_task = make_write_task();
     write_task.resume();
-
-    while (s->process_events(100ms) > 0)
-        ;
-
-    std::cerr << "scheduler.size() before shutdown = " << s->size() << "\n";
+    while (s->process_events(100ms) > 0) {}
     s->shutdown();
-    std::cerr << "scheduler.size() after shutdown = " << s->size() << "\n";
     REQUIRE(s->empty());
-    close(trigger_fds[0]);
-    close(trigger_fds[1]);
+    REQUIRE(read_task.is_ready());
+    REQUIRE(write_task.is_ready());
+    coro::sync_wait(read_task);
+    coro::sync_wait(write_task);
 }
 
 TEST_CASE("scheduler manual process events inline", "[scheduler]")
 {
-    auto trigger_fds = std::array<fd_t, 2>{};
-    REQUIRE(::pipe(trigger_fds.data()) == 0);
+    auto sockets = make_socket_pair();
     auto s = coro::scheduler::make_unique(coro::scheduler::options{
         .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
         .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_inline});
 
-    auto make_poll_read_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
+    auto make_read_task = [&]() -> coro::task<void>
     {
-        std::cerr << "poll task start s.size() == " << s->size() << "\n";
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == std::byte{42});
+    };
+    auto make_write_task = [&]() -> coro::task<void>
+    {
         co_await s->schedule();
-        std::cerr << "poll task polling s.size() == " << s->size() << "\n";
-        auto status = co_await s->poll(trigger_fd, coro::poll_op::read);
-        REQUIRE(status == coro::poll_status::read);
-        std::cerr << "poll task exiting s.size() == " << s->size() << "\n";
-        co_return;
+        const auto buffer    = std::array{std::byte{42}};
+        auto [status, bytes] = co_await s->write_some(sockets[1], buffer);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
     };
 
-    auto make_poll_write_task = [](std::unique_ptr<coro::scheduler>& s, int trigger_fd) -> coro::task<void>
-    {
-        std::cerr << "write task start s.size() == " << s->size() << "\n";
-        co_await s->schedule();
-        uint64_t value{42};
-        std::cerr << "write task writing s.size() == " << s->size() << "\n";
-        auto unused = write(trigger_fd, &value, sizeof(value));
-        (void)unused;
-        std::cerr << "write task exiting s.size() == " << s->size() << "\n";
-        co_return;
-    };
+    auto read_task = make_read_task();
+    read_task.resume();
+    REQUIRE_FALSE(read_task.is_ready());
+    REQUIRE(s->size() == 1);
+    REQUIRE_FALSE(s->empty());
 
-    auto poll_task  = make_poll_read_task(s, trigger_fds[0]);
-    auto write_task = make_poll_write_task(s, trigger_fds[1]);
-
-    // Start the tasks by scheduling them into the io scheduler.
-    poll_task.resume();
+    auto write_task = make_write_task();
     write_task.resume();
-
-    // Now process them to completion.
-    while (true)
-    {
-        auto remaining = s->process_events(100ms);
-        std::cerr << "remaining " << remaining << "\n";
-        if (remaining == 0)
-        {
-            break;
-        }
-    };
-
-    std::cerr << "scheduler.size() before shutdown = " << s->size() << "\n";
+    REQUIRE(s->size() == 2);
+    while (s->process_events(100ms) > 0) {}
     s->shutdown();
-    std::cerr << "scheduler.size() after shutdown = " << s->size() << "\n";
     REQUIRE(s->empty());
-    close(trigger_fds[0]);
-    close(trigger_fds[1]);
+    REQUIRE(read_task.is_ready());
+    REQUIRE(write_task.is_ready());
+    coro::sync_wait(read_task);
+    coro::sync_wait(write_task);
 }
 
 TEST_CASE("scheduler task throws", "[scheduler]")

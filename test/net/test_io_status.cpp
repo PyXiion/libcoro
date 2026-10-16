@@ -20,20 +20,3 @@ TEST_CASE("Mapping native codes", "[io_status]")
     CHECK(status.type == expected_kind);
     CHECK(status.native_code == input_code);
 }
-
-TEST_CASE("Mapping poll_status", "[io_status]")
-{
-    using ps = coro::poll_status;
-    using k  = coro::net::io_status::kind;
-
-    auto [input_status, expected_kind] = GENERATE(
-        table<ps, k>(
-            {{ps::read, k::ok},
-             {ps::write, k::ok},
-             {ps::timeout, k::timeout},
-             {ps::error, k::polling_error},
-             {ps::closed, k::closed},
-             {ps::cancelled, k::cancelled}}));
-
-    CHECK(coro::net::make_io_status_from_poll_status(input_status).type == expected_kind);
-}

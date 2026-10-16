@@ -249,7 +249,7 @@ TEST_CASE("tcp_server graceful shutdown via socket", "[tcp_server]")
     scheduler->spawn_detached(make_accept_task(server, started));
 
     coro::sync_wait(started);
-    // we'll wait a bit to make sure the server.poll() is fully registered.
+    // Wait until the pending accept has been registered.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     server.shutdown();

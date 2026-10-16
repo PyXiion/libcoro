@@ -8,6 +8,7 @@
     #include "coro/task.hpp"
 
     #include <fcntl.h>
+    #include <stop_token>
     #include <sys/socket.h>
 
 namespace coro
@@ -50,7 +51,8 @@ public:
      */
     auto poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) -> coro::task<coro::poll_status>
     {
-        return m_scheduler->poll(m_accept_socket, coro::poll_op::read, timeout, m_cancel_trigger.get_token());
+        return m_scheduler->poll(
+            m_accept_socket.native_handle(), coro::poll_op::read, timeout, m_stop_source.get_token());
     }
 
     /**
@@ -71,7 +73,7 @@ public:
 
     auto shutdown()
     {
-        m_cancel_trigger.signal_stop();
+        m_stop_source.request_stop();
         m_accept_socket.shutdown(net::socket::shutdown_how::read_write);
     }
 
@@ -84,8 +86,8 @@ private:
     options m_options;
     /// The socket for accepting new tcp connections on.
     net::socket m_accept_socket{-1};
-    /// Stop signal to trigger a cancellation of the async accept poll operation.
-    poll_stop_source m_cancel_trigger{};
+    /// Stop signal to cancel a pending readiness operation.
+    std::stop_source m_stop_source{};
 };
 
 } // namespace coro::net::tls
