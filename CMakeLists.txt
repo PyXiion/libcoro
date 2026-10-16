@@ -147,6 +147,7 @@ if(LIBCORO_FEATURE_NETWORKING)
         include/coro/detail/poll_info.hpp
         include/coro/detail/timer_handle.hpp src/detail/timer_handle.cpp
 
+        include/coro/platform.hpp
         include/coro/fd.hpp
         include/coro/scheduler.hpp src/scheduler.cpp
         include/coro/io_notifier.hpp
@@ -173,6 +174,7 @@ if(LIBCORO_FEATURE_NETWORKING)
         include/coro/net/socket_address.hpp
         include/coro/net/io_status.hpp src/net/io_status.cpp
         include/coro/net/socket.hpp src/net/socket.cpp
+        include/coro/net/detail/socket_api.hpp
         include/coro/net/tcp/client.hpp src/net/tcp/client.cpp
         include/coro/net/tcp/server.hpp src/net/tcp/server.cpp
         include/coro/net/udp/peer.hpp src/net/udp/peer.cpp

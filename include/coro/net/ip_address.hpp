@@ -1,7 +1,8 @@
 #pragma once
 
+#include "coro/net/detail/socket_api.hpp"
+
 #include <algorithm>
-#include <arpa/inet.h>
 #include <array>
 #include <cstring>
 #include <span>

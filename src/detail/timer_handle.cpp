@@ -1,11 +1,12 @@
 #include "coro/detail/timer_handle.hpp"
 
 #include "coro/io_notifier.hpp"
+#include "coro/platform.hpp"
 
 namespace coro::detail
 {
 
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(CORO_PLATFORM_BSD)
 
 static auto kqueue_current_timer_fd = std::atomic<fd_t>{0};
 
@@ -16,7 +17,7 @@ timer_handle::timer_handle(const void* timer_handle_ptr, io_notifier& notifier)
     (void)notifier;
 }
 
-#elif defined(__linux__)
+#elif defined(CORO_PLATFORM_LINUX)
 
 timer_handle::timer_handle(const void* timer_handle_ptr, io_notifier& notifier)
     : m_fd(::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)),

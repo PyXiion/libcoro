@@ -1,9 +1,9 @@
 #pragma once
 
+#include "coro/net/detail/socket_api.hpp"
 #include "ip_address.hpp"
 #include <cstdint>
 #include <cstring>
-#include <sys/socket.h>
 namespace coro::net
 {
 /**
@@ -26,7 +26,7 @@ public:
             sin->sin_port   = htons(port);
 
             // BSD-specific field, redundant for input
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(CORO_PLATFORM_BSD)
             sin->sin_len = sizeof(sockaddr_in);
 #endif
 
@@ -40,7 +40,7 @@ public:
             sin6->sin6_port   = htons(port);
 
             // BSD-specific field
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(CORO_PLATFORM_BSD)
             sin6->sin6_len = sizeof(sockaddr_in6);
 #endif
 

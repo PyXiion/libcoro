@@ -72,7 +72,7 @@ public:
     auto shutdown()
     {
         m_cancel_trigger.signal_stop();
-        m_accept_socket.shutdown(coro::poll_op::read_write);
+        m_accept_socket.shutdown(net::socket::shutdown_how::read_write);
     }
 
 private:

@@ -1,9 +1,13 @@
 #include "coro/net/io_status.hpp"
+#include "coro/platform.hpp"
 #include <system_error>
 
-#if defined(_WIN32)
+#if defined(CORO_PLATFORM_WINDOWS)
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
     #endif
     #include <windows.h>
     #include <winsock2.h>
@@ -21,7 +25,7 @@ std::string coro::net::io_status::message() const
         return "Success";
     }
 
-#if defined(_WIN32)
+#if defined(CORO_PLATFORM_WINDOWS)
     char*  buffer = nullptr;
     size_t size   = FormatMessageA(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -38,6 +42,7 @@ std::string coro::net::io_status::message() const
         LocalFree(buffer);
         return msg;
     }
+    return "Unknown system error (" + std::to_string(native_code) + ")";
 #else // Linux/BSD
     try
     {
@@ -45,15 +50,54 @@ std::string coro::net::io_status::message() const
     }
     catch (...)
     {
-        return "Unknown system error" + std::to_string(native_code) + ")";
+        return "Unknown system error (" + std::to_string(native_code) + ")";
     }
 #endif
 }
 
 auto coro::net::make_io_status_from_native(int native_code) -> coro::net::io_status
 {
-#if defined(_WIN32)
-    #error "TODO: WIN32"
+#if defined(CORO_PLATFORM_WINDOWS)
+    using kind = io_status::kind;
+    kind type;
+    switch (native_code)
+    {
+        case 0:
+            type = kind::ok;
+            break;
+        case WSAECONNREFUSED:
+            type = kind::connection_refused;
+            break;
+        case WSAECONNRESET:
+        case WSAECONNABORTED:
+            type = kind::connection_reset;
+            break;
+        case WSAEWOULDBLOCK:
+        case WSA_IO_PENDING:
+            type = kind::would_block_or_try_again;
+            break;
+        case WSAEMSGSIZE:
+            type = kind::message_too_big;
+            break;
+        case WSAETIMEDOUT:
+            type = kind::timeout;
+            break;
+        case WSA_OPERATION_ABORTED:
+    #if ERROR_OPERATION_ABORTED != WSA_OPERATION_ABORTED
+        case ERROR_OPERATION_ABORTED:
+    #endif
+            type = kind::cancelled;
+            break;
+        case WSAENOTCONN:
+        case WSAESHUTDOWN:
+        case WSAEDISCON:
+            type = kind::closed;
+            break;
+        default:
+            type = kind::native;
+            break;
+    }
+    return coro::net::io_status{.type = type, .native_code = native_code};
 #else // Linux/BSD
     using kind = io_status::kind;
     kind type;

@@ -1,17 +1,19 @@
 #pragma once
 
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include "coro/platform.hpp"
+
+#if defined(CORO_PLATFORM_BSD)
     #include "coro/detail/io_notifier_kqueue.hpp"
-#elif defined(__linux__)
+#elif defined(CORO_PLATFORM_LINUX)
     #include "coro/detail/io_notifier_epoll.hpp"
 #endif
 
 namespace coro
 {
 
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(CORO_PLATFORM_BSD)
 using io_notifier = detail::io_notifier_kqueue;
-#elif defined(__linux__)
+#elif defined(CORO_PLATFORM_LINUX)
 using io_notifier = detail::io_notifier_epoll;
 #endif
 

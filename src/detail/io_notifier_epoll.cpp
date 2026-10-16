@@ -7,12 +7,27 @@
 #include "coro/detail/poll_info.hpp"
 #include "coro/detail/timer_handle.hpp"
 #include "coro/fd.hpp"
+#include "coro/platform.hpp"
 #include "coro/poll.hpp"
 
 using namespace std::chrono_literals;
 
 namespace coro::detail
 {
+
+static auto poll_op_to_events(poll_op op) -> uint32_t
+{
+    uint32_t events{0};
+    if (poll_op_readable(op))
+    {
+        events |= EPOLLIN;
+    }
+    if (poll_op_writeable(op))
+    {
+        events |= EPOLLOUT;
+    }
+    return events;
+}
 
 /**
  * Encode the state needed to rewind the correct poll info after an event occured into the user data of an epoll event.
@@ -82,7 +97,7 @@ auto io_notifier_epoll::watch_timer(const timer_handle& timer, std::chrono::nano
 auto io_notifier_epoll::watch(fd_t fd, poll_op op, void* data, bool keep, bool is_cancel_event) -> bool
 {
     auto event_data     = event_t{};
-    event_data.events   = static_cast<uint32_t>(op) | EPOLLRDHUP;
+    event_data.events   = poll_op_to_events(op) | EPOLLRDHUP;
     event_data.data.u64 = encode_udata(keep, is_cancel_event, data);
 
     if (!keep)
@@ -163,11 +178,11 @@ auto io_notifier_epoll::next_events(
 
 auto io_notifier_epoll::event_to_poll_status(const event_t& event) -> poll_status
 {
-    if (event.events & static_cast<uint32_t>(poll_op::read))
+    if (event.events & EPOLLIN)
     {
         return poll_status::read;
     }
-    if (event.events & static_cast<uint32_t>(poll_op::write))
+    if (event.events & EPOLLOUT)
     {
         return poll_status::write;
     }

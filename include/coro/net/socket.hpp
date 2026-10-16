@@ -1,12 +1,9 @@
 #pragma once
 
+#include "coro/net/detail/socket_api.hpp"
 #include "coro/net/socket_address.hpp"
-#include "coro/poll.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
 #include <span>
-#include <unistd.h>
 #include <utility>
 
 #include <iostream>
@@ -32,6 +29,13 @@ public:
         no
     };
 
+    enum class shutdown_how
+    {
+        read,
+        write,
+        read_write
+    };
+
     struct options
     {
         /// The type of socket.
@@ -43,21 +47,21 @@ public:
     static auto type_to_os(type_t type) -> int;
 
     socket() = default;
-    explicit socket(int fd) : m_fd(fd) {}
+    explicit socket(native_handle_t handle) : m_handle(handle) {}
 
-    socket(const socket& other) : m_fd(dup(other.m_fd)) {}
-    socket(socket&& other) noexcept : m_fd(std::exchange(other.m_fd, -1)) {}
+    socket(const socket& other);
+    socket(socket&& other) noexcept : m_handle(std::exchange(other.m_handle, invalid_native_handle)) {}
     auto operator=(const socket& other) noexcept -> socket&;
     auto operator=(socket&& other) noexcept -> socket&;
 
     ~socket() { close(); }
 
     /**
-     * This function returns true if the socket's file descriptor is a valid number, however it does
+     * This function returns true if the socket's native handle is valid, however it does
      * not imply if the socket is still usable.
-     * @return True if the socket file descriptor is > 0.
+     * @return True if the socket has a valid native handle.
      */
-    [[nodiscard]] auto is_ok() const -> bool { return m_fd != -1; }
+    [[nodiscard]] auto is_ok() const -> bool { return m_handle != invalid_native_handle; }
 
     explicit operator bool() const { return is_ok(); }
 
@@ -70,7 +74,7 @@ public:
      * @param how Shuts the socket down with the given operations.
      * @return Returns true if the sockets given operations were shutdown.
      */
-    auto shutdown(poll_op how = poll_op::read_write) -> bool;
+    auto shutdown(shutdown_how how = shutdown_how::read_write) -> bool;
 
     /**
      * Closes the socket and sets this socket to an invalid state.
@@ -80,10 +84,10 @@ public:
     /**
      * @return The native handle (file descriptor) for this socket.
      */
-    auto native_handle() const -> int { return m_fd; }
+    auto native_handle() const -> native_handle_t { return m_handle; }
 
 private:
-    int m_fd{-1};
+    native_handle_t m_handle{invalid_native_handle};
 };
 
 /**

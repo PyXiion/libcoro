@@ -8,12 +8,18 @@
 
 #include "coro/detail/poll_info.hpp"
 #include "coro/detail/timer_handle.hpp"
+#include "coro/platform.hpp"
 #include "coro/poll.hpp"
 
 using namespace std::chrono_literals;
 
 namespace coro::detail
 {
+
+static auto poll_op_to_filter(poll_op op) -> int16_t
+{
+    return op == poll_op::read ? EVFILT_READ : EVFILT_WRITE;
+}
 
 io_notifier_kqueue::io_notifier_kqueue() : m_fd{::kqueue()}
 {
@@ -52,6 +58,12 @@ auto io_notifier_kqueue::watch_timer(const timer_handle& timer, std::chrono::nan
 
 auto io_notifier_kqueue::watch(fd_t fd, poll_op op, void* data, bool keep) -> bool
 {
+    // A read-write operation needs one registration for each kqueue filter.
+    if (op == poll_op::read_write)
+    {
+        return watch(fd, poll_op::read, data, keep) && watch(fd, poll_op::write, data, keep);
+    }
+
     auto event_data = event_t{};
     auto mode       = EV_ADD | EV_CLEAR | EV_ENABLE;
     if (!keep)
@@ -59,27 +71,15 @@ auto io_notifier_kqueue::watch(fd_t fd, poll_op op, void* data, bool keep) -> bo
         mode |= EV_ONESHOT;
     }
 
-    EV_SET(&event_data, fd, static_cast<int16_t>(op), mode, 0, 0, data);
+    EV_SET(&event_data, fd, poll_op_to_filter(op), mode, 0, 0, data);
     return ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) != -1;
 }
 
 auto io_notifier_kqueue::watch(poll_info& pi) -> bool
 {
-    // For read-write event, we need to register both event types separately to the kqueue
-    if (pi.m_op == poll_op::read_write)
+    if (!watch(pi.m_fd, pi.m_op, static_cast<void*>(&pi), false))
     {
-        if (!watch(pi.m_fd, poll_op::read, static_cast<void*>(&pi), false) ||
-            !watch(pi.m_fd, poll_op::write, static_cast<void*>(&pi), false))
-        {
-            return false;
-        }
-    }
-    else
-    {
-        if (!watch(pi.m_fd, pi.m_op, static_cast<void*>(&pi), false))
-        {
-            return false;
-        }
+        return false;
     }
 
     if (pi.m_cancel_trigger.has_value())
@@ -97,10 +97,10 @@ auto io_notifier_kqueue::unwatch(fd_t fd, poll_op op) -> bool
     {
         auto event_data = event_t{};
 
-        EV_SET(&event_data, fd, static_cast<int16_t>(coro::poll_op::read), EV_DELETE, 0, 0, nullptr);
+        EV_SET(&event_data, fd, poll_op_to_filter(coro::poll_op::read), EV_DELETE, 0, 0, nullptr);
         ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr);
 
-        EV_SET(&event_data, fd, static_cast<int16_t>(coro::poll_op::write), EV_DELETE, 0, 0, nullptr);
+        EV_SET(&event_data, fd, poll_op_to_filter(coro::poll_op::write), EV_DELETE, 0, 0, nullptr);
         ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr);
 
         return true;
@@ -108,7 +108,7 @@ auto io_notifier_kqueue::unwatch(fd_t fd, poll_op op) -> bool
     else
     {
         auto event_data = event_t{};
-        EV_SET(&event_data, fd, static_cast<int16_t>(op), EV_DELETE, 0, 0, nullptr);
+        EV_SET(&event_data, fd, poll_op_to_filter(op), EV_DELETE, 0, 0, nullptr);
         return ::kevent(m_fd, &event_data, 1, nullptr, 0, nullptr) != -1;
     }
 }
