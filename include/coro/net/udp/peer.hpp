@@ -28,9 +28,9 @@ public:
      */
     explicit peer(std::unique_ptr<coro::scheduler>& scheduler, const net::socket_address& endpoint);
 
-    peer(const peer&) noexcept = default;
+    peer(const peer&) = delete;
     peer(peer&&) noexcept;
-    auto operator=(const peer&) noexcept -> peer&;
+    auto operator=(const peer&) -> peer& = delete;
     auto operator=(peer&&) noexcept -> peer&;
     ~peer() = default;
 
@@ -76,6 +76,8 @@ public:
      *         The span view of the data will be set to the size of the received data, this will
      *         always start at the beggining of the buffer but depending on how large the data was
      *         it might not fill the entire buffer.
+     *         A datagram larger than the buffer succeeds with the prefix that fits;
+     *         the remaining bytes of that datagram are discarded.
      */
     template<concepts::mutable_buffer buffer_type>
     auto read_from(
@@ -103,7 +105,7 @@ private:
     /// The scheduler that will drive this udp client.
     coro::scheduler* m_scheduler;
     /// The udp socket.
-    net::socket m_socket{-1};
+    net::socket m_socket{net::invalid_native_handle};
     /// Did the user request this udp socket is bound locally to receive packets?
     bool m_bound{false};
 };

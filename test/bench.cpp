@@ -13,9 +13,7 @@
 #include <iostream>
 
 TEST_CASE("bench", "[bench]")
-{
-    std::cerr << "[bench]\n\n";
-}
+{ std::cerr << "[bench]\n\n"; }
 
 using namespace std::chrono_literals;
 using sc = std::chrono::steady_clock;
@@ -23,8 +21,8 @@ using sc = std::chrono::steady_clock;
 constexpr std::size_t default_iterations = 5'000'000;
 // constexpr std::size_t default_iterations = 10;
 
-static auto
-    print_stats(const std::string& bench_name, uint64_t operations, sc::time_point start, sc::time_point stop) -> void
+static auto print_stats(const std::string& bench_name, uint64_t operations, sc::time_point start, sc::time_point stop)
+    -> void
 {
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start);
     auto ms       = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
@@ -390,9 +388,10 @@ TEST_CASE("benchmark tcp::server echo server thread pool", "[benchmark][tcp]")
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> clients_completed{0};
 
-    auto server_scheduler = coro::scheduler::make_unique(coro::scheduler::options{
-        .pool               = coro::thread_pool::options{},
-        .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
+    auto server_scheduler = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool               = coro::thread_pool::options{},
+            .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
     auto make_server_task = [](std::unique_ptr<coro::scheduler>& server_scheduler,
                                std::atomic<uint64_t>&            listening,
                                std::atomic<uint64_t>&            accepted) -> coro::task<void>
@@ -459,9 +458,10 @@ TEST_CASE("benchmark tcp::server echo server thread pool", "[benchmark][tcp]")
     std::mutex                                    g_histogram_mutex;
     std::map<std::chrono::milliseconds, uint64_t> g_histogram;
 
-    auto client_scheduler = coro::scheduler::make_unique(coro::scheduler::options{
-        .pool               = coro::thread_pool::options{},
-        .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
+    auto client_scheduler = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool               = coro::thread_pool::options{},
+            .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
     auto make_client_task = [](std::unique_ptr<coro::scheduler>&              client_scheduler,
                                const std::string&                             msg,
                                std::atomic<uint64_t>&                         clients_completed,
@@ -808,9 +808,10 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> clients_completed{0};
 
-    auto server_scheduler = coro::scheduler::make_unique(coro::scheduler::options{
-        .pool               = coro::thread_pool::options{},
-        .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
+    auto server_scheduler = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool               = coro::thread_pool::options{},
+            .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
     auto make_server_task = [](std::unique_ptr<coro::scheduler>& server_scheduler,
                                std::atomic<uint64_t>&            listening,
                                std::atomic<uint64_t>&            accepted) -> coro::task<void>
@@ -832,7 +833,7 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
                 REQUIRE_THREAD_SAFE(rstatus.is_ok());
 
                 auto data                 = std::string_view{rspan.data(), rspan.size()};
-                auto [sstatus, remaining] = co_await client.write_all(data);
+                auto [sstatus, remaining] = co_await coro::net::write_all(client, data);
                 REQUIRE_THREAD_SAFE(sstatus.is_ok());
                 REQUIRE_THREAD_SAFE(remaining.empty());
             }
@@ -872,9 +873,10 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
     coro::mutex                                   histogram_mutex;
     std::map<std::chrono::milliseconds, uint64_t> g_histogram;
 
-    auto client_scheduler = coro::scheduler::make_unique(coro::scheduler::options{
-        .pool               = coro::thread_pool::options{},
-        .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
+    auto client_scheduler = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool               = coro::thread_pool::options{},
+            .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool});
     auto make_client_task = [](std::unique_ptr<coro::scheduler>&              client_scheduler,
                                const std::string&                             msg,
                                std::atomic<uint64_t>&                         clients_completed,
@@ -887,7 +889,7 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
             coro::net::tls::client                        client{
                 client_scheduler,
                 std::make_shared<coro::net::tls::context>(coro::net::tls::verify_peer_t::no),
-                                       {"127.0.0.1", 8080}};
+                {"127.0.0.1", 8080}};
 
             auto cstatus = co_await client.connect();
             REQUIRE_THREAD_SAFE(cstatus == coro::net::tls::connection_status::connected);
@@ -898,11 +900,11 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
             {
                 auto req_start = std::chrono::steady_clock::now();
 
-                auto [sstatus, remaining] = co_await client.write_all(msg);
+                auto [sstatus, remaining] = co_await coro::net::write_all(client, msg);
                 REQUIRE_THREAD_SAFE(sstatus.is_ok());
                 REQUIRE_THREAD_SAFE(remaining.empty());
 
-                auto [rstatus, rspan] = co_await client.read_exact(in, std::chrono::seconds{30});
+                auto [rstatus, rspan] = co_await coro::net::read_exact(client, in, std::chrono::seconds{30});
                 if (rstatus.is_closed())
                 {
                     REQUIRE_THREAD_SAFE(rspan.empty());
@@ -910,7 +912,7 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
                 }
                 if (rstatus.is_timeout())
                 {
-                    std::cerr << "client.read_exact() timeout, closing\n";
+                    std::cerr << "coro::net::read_exact() timeout, closing\n";
                     break;
                 }
                 REQUIRE_THREAD_SAFE(rstatus.is_ok());
@@ -977,6 +979,4 @@ TEST_CASE("benchmark tls::server echo server thread pool", "[benchmark]")
 #endif     // LIBCORO_FEATURE_NETWORKING
 
 TEST_CASE("~bench", "[bench]")
-{
-    std::cerr << "[~bench]\n\n";
-}
+{ std::cerr << "[~bench]\n\n"; }

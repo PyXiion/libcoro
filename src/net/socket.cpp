@@ -27,9 +27,7 @@ struct wsa_init
 };
 
 auto ensure_wsa_init() -> void
-{
-    static wsa_init init;
-}
+{ static wsa_init init; }
 } // namespace
 #endif
 
@@ -46,37 +44,15 @@ auto socket::type_to_os(type_t type) -> int
     }
 }
 
-socket::socket(const socket& other)
-{
-#if defined(CORO_PLATFORM_WINDOWS)
-    WSAPROTOCOL_INFOW info;
-    if (WSADuplicateSocketW(other.m_handle, GetCurrentProcessId(), &info) == 0)
-    {
-        m_handle =
-            WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0, WSA_FLAG_OVERLAPPED);
-    }
-#else
-    m_handle = dup(other.m_handle);
-#endif
-}
-
-auto socket::operator=(const socket& other) noexcept -> socket&
-{
-    if (std::addressof(other) != this)
-    {
-        socket copy{other};
-        this->close();
-        this->m_handle = std::exchange(copy.m_handle, invalid_native_handle);
-    }
-    return *this;
-}
-
 auto socket::operator=(socket&& other) noexcept -> socket&
 {
     if (std::addressof(other) != this)
     {
         this->close();
         m_handle = std::exchange(other.m_handle, invalid_native_handle);
+#if defined(CORO_PLATFORM_WINDOWS)
+        m_iocp_binding.store(other.m_iocp_binding.exchange(0, std::memory_order::relaxed), std::memory_order::relaxed);
+#endif
     }
 
     return *this;
@@ -147,6 +123,7 @@ auto socket::close() -> void
     {
 #if defined(CORO_PLATFORM_WINDOWS)
         closesocket(m_handle);
+        m_iocp_binding.store(0, std::memory_order::relaxed);
 #else
         ::close(m_handle);
 #endif
@@ -178,8 +155,7 @@ auto make_socket(const socket::options& opts, domain_t domain) -> socket
     return s;
 }
 
-auto make_accept_socket(const socket::options& opts, const net::socket_address&endpoint, int32_t backlog)
-    -> socket
+auto make_accept_socket(const socket::options& opts, const net::socket_address& endpoint, int32_t backlog) -> socket
 {
     socket s = make_socket(opts, endpoint.domain());
 
@@ -202,7 +178,7 @@ auto make_accept_socket(const socket::options& opts, const net::socket_address&e
     {
         throw std::runtime_error{"Failed to setsockopt(SO_REUSEADDR)"};
     }
-#endif
+    #endif
 
     if (setsockopt(s.native_handle(), SOL_SOCKET, SO_REUSEPORT, &sock_opt, sizeof(sock_opt)) < 0)
     {

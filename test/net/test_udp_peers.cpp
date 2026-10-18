@@ -6,6 +6,10 @@
     #include "catch_net_extensions.hpp"
     #include <coro/coro.hpp>
 
+    #include <array>
+    #include <chrono>
+    #include <string_view>
+
 TEST_CASE("udp one way", "[udp]")
 {
     const std::string msg{"aaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbcccccccccccccccccc"};
@@ -171,9 +175,7 @@ TEST_CASE("udp timeout", "[udp]")
     };
 
     DYNAMIC_SECTION("Domain: " << to_string(clientAddress.domain()))
-    {
-        coro::sync_wait(make_client_task(scheduler, clientAddress, clientFinishEvent, timeout));
-    }
+    { coro::sync_wait(make_client_task(scheduler, clientAddress, clientFinishEvent, timeout)); }
 }
 
 TEST_CASE("udp not bound", "[udp]")
@@ -194,6 +196,114 @@ TEST_CASE("udp not bound", "[udp]")
     };
 
     coro::sync_wait(task(scheduler));
+}
+
+namespace
+{
+
+template<typename Operation, typename Hook>
+struct receive_wrapper
+{
+    Operation& m_op;
+    Hook       m_hook;
+
+    auto await_ready() -> bool
+    {
+        const auto ready = m_op.await_ready();
+        if (!ready)
+        {
+            m_hook();
+        }
+        return ready;
+    }
+
+    auto await_suspend(std::coroutine_handle<> handle) -> bool { return m_op.await_suspend(handle); }
+
+    auto await_resume() -> auto { return m_op.await_resume(); }
+};
+
+} // namespace
+
+TEST_CASE("udp recv_from truncation", "[udp]")
+{
+    using namespace std::chrono_literals;
+    const std::string_view timing = GENERATE("before_ready", "between_ready_and_suspend", "after_suspend");
+
+    DYNAMIC_SECTION(timing)
+    {
+        auto scheduler = coro::scheduler::make_unique(
+            coro::scheduler::options{
+                .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
+                .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_inline});
+        const auto options =
+            coro::net::socket::options{coro::net::socket::type_t::udp, coro::net::socket::blocking_t::no};
+        auto receiver = coro::net::make_accept_socket(options, {"127.0.0.1", 0}, 0);
+        auto sender   = coro::net::make_accept_socket(options, {"127.0.0.1", 0}, 0);
+
+        auto receiver_endpoint     = coro::net::socket_address::make_uninitialised();
+        auto [recv_addr, recv_len] = receiver_endpoint.native_mutable_data();
+        REQUIRE(::getsockname(receiver.native_handle(), recv_addr, recv_len) == 0);
+        auto sender_endpoint       = coro::net::socket_address::make_uninitialised();
+        auto [send_addr, send_len] = sender_endpoint.native_mutable_data();
+        REQUIRE(::getsockname(sender.native_handle(), send_addr, send_len) == 0);
+
+        auto send_datagram = [&](std::string_view payload) -> void
+        {
+            const auto [address, length] = receiver_endpoint.data();
+            auto sent =
+                ::sendto(sender.native_handle(), payload.data(), static_cast<int>(payload.size()), 0, address, length);
+            REQUIRE(sent == static_cast<decltype(sent)>(payload.size()));
+        };
+
+        auto receive = [&]() -> coro::task<void>
+        {
+            std::array<std::byte, 4> first_buffer{};
+            auto                     operation             = scheduler->recv_from(receiver, first_buffer, 1s);
+            auto [first_status, first_bytes, first_sender] = co_await receive_wrapper{
+                operation,
+                [&]()
+                {
+                    if (timing == "between_ready_and_suspend")
+                    {
+                        send_datagram("12345678");
+                    }
+                }};
+
+            // Check a second datagram before asserting, so a failed first result leaves no pending coroutine.
+            send_datagram("abcdefgh");
+            std::array<std::byte, 8> second_buffer{};
+            auto [second_status, second_bytes, second_sender] =
+                co_await scheduler->recv_from(receiver, second_buffer, 1s);
+
+            CHECK_THAT(first_status, IsOk());
+            CHECK(first_bytes == first_buffer.size());
+            CHECK(std::string_view{reinterpret_cast<const char*>(first_buffer.data()), first_buffer.size()} == "1234");
+            CHECK(first_sender == sender_endpoint);
+            CHECK_THAT(second_status, IsOk());
+            CHECK(second_bytes == second_buffer.size());
+            CHECK(
+                std::string_view{reinterpret_cast<const char*>(second_buffer.data()), second_buffer.size()} ==
+                "abcdefgh");
+            CHECK(second_sender == sender_endpoint);
+        };
+
+        if (timing == "before_ready")
+        {
+            send_datagram("12345678");
+        }
+        scheduler->io_notifier().wake();
+        auto task = receive();
+        task.handle().resume();
+        if (timing == "after_suspend")
+        {
+            send_datagram("12345678");
+        }
+        while (scheduler->process_events(100ms) > 0) {}
+        scheduler->shutdown();
+        REQUIRE(scheduler->empty());
+        REQUIRE(task.is_ready());
+        coro::sync_wait(task);
+    }
 }
 
 #endif // LIBCORO_FEATURE_NETWORKING

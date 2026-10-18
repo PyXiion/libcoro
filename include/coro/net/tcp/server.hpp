@@ -5,9 +5,7 @@
 #include "coro/net/tcp/client.hpp"
 #include "coro/task.hpp"
 
-#include <fcntl.h>
 #include <stop_token>
-#include <sys/socket.h>
 
 namespace coro
 {
@@ -83,10 +81,10 @@ public:
         auto client_endpoint     = socket_address::make_uninitialised();
         auto [sockaddr, socklen] = client_endpoint.native_mutable_data();
 
-        int sock_fd = ::accept(m_accept_socket.native_handle(), sockaddr, socklen);
-        if (sock_fd == -1)
+        net::native_handle_t sock_fd = ::accept(m_accept_socket.native_handle(), sockaddr, socklen);
+        if (sock_fd == net::invalid_native_handle)
         {
-            return unexpected<io_status>{make_io_status_from_native(errno)};
+            return unexpected<io_status>{make_io_status_from_native(net::detail::last_native_error())};
         }
 
         return tcp::client{m_scheduler, net::socket{sock_fd}, client_endpoint};
@@ -99,7 +97,7 @@ private:
     /// The bind and listen options for this server.
     options m_options;
     /// The socket for accepting new tcp connections on.
-    net::socket m_accept_socket{-1};
+    net::socket m_accept_socket{net::invalid_native_handle};
     /// Stop signal to cancel a pending accept operation.
     std::stop_source m_stop_source{};
 };

@@ -22,7 +22,7 @@ enum class connection_status
     unexpected_close,
     /// The given ip address could not be parsed or is invalid.
     invalid_ip_address,
-    /// There was an unrecoverable error, use errno to get more information on the specific error.
+    /// There was an unrecoverable connection error.
     error
 };
 

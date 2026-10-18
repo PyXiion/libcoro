@@ -93,7 +93,6 @@ auto perform_posix(async_operation& op) -> bool
                 break;
             }
             case async_op_kind::timer:
-            case async_op_kind::poll:
                 return false;
         }
 

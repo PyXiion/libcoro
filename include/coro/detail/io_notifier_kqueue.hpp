@@ -24,8 +24,8 @@ class timer_handle;
 class io_notifier_kqueue
 {
     static const constexpr std::size_t m_max_events = 16;
-    static constexpr const int m_wake_object{0};
-    static constexpr std::uintptr_t m_wake_ident = 1;
+    static constexpr const int         m_wake_object{0};
+    static constexpr std::uintptr_t    m_wake_ident = 1;
 
     fd_t m_fd;
 
@@ -53,7 +53,8 @@ public:
     static auto try_now(async_operation& op) -> bool;
     auto        submit(async_operation& op) -> bool;
     auto        complete_ready(async_operation& op, poll_status status) -> bool;
-    auto        cancel(async_operation& op) -> void;
+    /// Readiness backends release the operation immediately, so this always returns true.
+    auto cancel(async_operation& op) -> bool;
 
     auto unwatch(fd_t fd, poll_op op) -> bool;
 

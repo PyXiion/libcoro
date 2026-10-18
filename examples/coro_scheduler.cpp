@@ -63,7 +63,7 @@ int main()
 
         // Send the server response to the client.
         std::string response        = "Hello from server.";
-        auto [write_status, unsent] = co_await client->write_all(response);
+        auto [write_status, unsent] = co_await coro::net::write_all(*client, response);
         if (!write_status.is_ok())
         {
             std::cout << "server error: " << write_status.message() << "\n";
@@ -88,7 +88,7 @@ int main()
         co_await client.connect();
 
         // Send the request data.
-        co_await client.write_all(std::string_view{"Hello from client."});
+        co_await coro::net::write_all(client, std::string_view{"Hello from client."});
 
         // Wait for the response and receive it.
         std::string response(256, '\0');

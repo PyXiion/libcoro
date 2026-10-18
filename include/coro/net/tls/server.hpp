@@ -75,7 +75,7 @@ private:
     /// The bind and listen options for this server.
     options m_options;
     /// The socket for accepting new tcp connections on.
-    net::socket m_accept_socket{-1};
+    net::socket m_accept_socket{net::invalid_native_handle};
     /// Stop signal to cancel a pending accept or TLS handshake.
     std::stop_source m_stop_source{};
 };

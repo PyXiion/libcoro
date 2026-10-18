@@ -4,7 +4,6 @@
 #include "coro/detail/awaiter_list.hpp"
 #include "coro/detail/timer_handle.hpp"
 #include "coro/expected.hpp"
-#include "coro/fd.hpp"
 #include "coro/io_notifier.hpp"
 #include "coro/poll.hpp"
 #include "coro/thread_pool.hpp"
@@ -27,14 +26,6 @@
 
 namespace coro
 {
-#ifdef LIBCORO_FEATURE_NETWORKING
-namespace net::dns
-{
-template<concepts::io_executor executor_type>
-class resolver;
-}
-#endif
-
 enum timeout_status
 {
     no_timeout,
@@ -338,9 +329,7 @@ public:
      */
     template<class rep_type, class period_type>
     [[nodiscard]] auto schedule_after(std::chrono::duration<rep_type, period_type> amount) -> coro::task<void>
-    {
-        return yield_for_internal(std::chrono::duration_cast<std::chrono::nanoseconds>(amount));
-    }
+    { return yield_for_internal(std::chrono::duration_cast<std::chrono::nanoseconds>(amount)); }
 
     /**
      * Schedules the current task to run at a given time point in the future.
@@ -361,9 +350,7 @@ public:
      */
     template<class rep_type, class period_type>
     [[nodiscard]] auto yield_for(std::chrono::duration<rep_type, period_type> amount) -> coro::task<void>
-    {
-        return yield_for_internal(std::chrono::duration_cast<std::chrono::nanoseconds>(amount));
-    }
+    { return yield_for_internal(std::chrono::duration_cast<std::chrono::nanoseconds>(amount)); }
 
     /**
      * Yields the current task until the given time point in the future.
@@ -400,17 +387,15 @@ public:
             std::size_t                length,
             const net::socket_address* endpoint,
             std::chrono::nanoseconds   timeout,
-            std::stop_token            stop,
-            coro::poll_op              poll_op = coro::poll_op::read)
+            std::stop_token            stop)
             : m_scheduler(scheduler),
               m_timeout(timeout),
               m_stop(stop)
         {
-            m_op.m_kind    = kind;
-            m_op.m_fd      = fd;
-            m_op.m_buffer  = buffer;
-            m_op.m_length  = length;
-            m_op.m_poll_op = poll_op;
+            m_op.m_kind   = kind;
+            m_op.m_fd     = fd;
+            m_op.m_buffer = buffer;
+            m_op.m_length = length;
             if constexpr (has_address)
             {
                 if (endpoint != nullptr)
@@ -419,6 +404,21 @@ public:
                 }
                 m_op.m_address = &m_address;
             }
+        }
+
+        operation(
+            scheduler&                 scheduler,
+            net::socket&               sock,
+            void*                      buffer,
+            std::size_t                length,
+            const net::socket_address* endpoint,
+            std::chrono::nanoseconds   timeout,
+            std::stop_token            stop)
+            : operation(scheduler, sock.native_handle(), buffer, length, endpoint, timeout, std::move(stop))
+        {
+#if defined(CORO_PLATFORM_WINDOWS)
+            m_op.m_iocp_binding = &sock.m_iocp_binding;
+#endif
         }
 
     public:
@@ -438,8 +438,7 @@ public:
         {
             if (m_stop.stop_requested())
             {
-                m_op.m_status      = {net::io_status::kind::cancelled};
-                m_op.m_poll_status = poll_status::cancelled;
+                m_op.m_status = {net::io_status::kind::cancelled};
                 return true;
             }
             return ::coro::io_notifier::try_now(m_op);
@@ -483,10 +482,6 @@ public:
             {
                 return;
             }
-            else if constexpr (kind == detail::async_op_kind::poll)
-            {
-                return m_op.m_poll_status;
-            }
             else if constexpr (kind == detail::async_op_kind::connect)
             {
                 return m_op.m_status;
@@ -527,50 +522,41 @@ public:
 
     /// For all I/O operations, keep the coroutine frame, socket and buffer alive until completion.
     /// Do not destroy a pending coroutine: request cancellation or set a timeout, then await its result.
+    /// On Windows the socket is bound to the first scheduler it waits on; waiting on another scheduler fails with a
+    /// native WSAEINVAL status.
     [[nodiscard]] auto read_some(
         net::socket&              sock,
         std::span<std::byte>      buffer,
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
         std::stop_token           stop    = {}) -> operation<detail::async_op_kind::read>
-    {
-        return {*this, sock.native_handle(), buffer.data(), buffer.size(), nullptr, timeout, stop};
-    }
+    { return {*this, sock, buffer.data(), buffer.size(), nullptr, timeout, stop}; }
 
     [[nodiscard]] auto write_some(
         net::socket&               sock,
         std::span<const std::byte> buffer,
         std::chrono::milliseconds  timeout = std::chrono::milliseconds{0},
         std::stop_token            stop    = {}) -> operation<detail::async_op_kind::write>
-    {
-        return {
-            *this, sock.native_handle(), const_cast<std::byte*>(buffer.data()), buffer.size(), nullptr, timeout, stop};
-    }
+    { return {*this, sock, const_cast<std::byte*>(buffer.data()), buffer.size(), nullptr, timeout, stop}; }
 
     [[nodiscard]] auto accept(
         net::socket&              listener,
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
         std::stop_token           stop    = {}) -> operation<detail::async_op_kind::accept>
-    {
-        return {*this, listener.native_handle(), nullptr, 0, nullptr, timeout, stop};
-    }
+    { return {*this, listener, nullptr, 0, nullptr, timeout, stop}; }
 
     [[nodiscard]] auto connect(
         net::socket&               sock,
         const net::socket_address& endpoint,
         std::chrono::milliseconds  timeout = std::chrono::milliseconds{0},
         std::stop_token            stop    = {}) -> operation<detail::async_op_kind::connect>
-    {
-        return {*this, sock.native_handle(), nullptr, 0, &endpoint, timeout, stop};
-    }
+    { return {*this, sock, nullptr, 0, &endpoint, timeout, stop}; }
 
     [[nodiscard]] auto recv_from(
         net::socket&              sock,
         std::span<std::byte>      buffer,
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
         std::stop_token           stop    = {}) -> operation<detail::async_op_kind::recv_from>
-    {
-        return {*this, sock.native_handle(), buffer.data(), buffer.size(), nullptr, timeout, stop};
-    }
+    { return {*this, sock, buffer.data(), buffer.size(), nullptr, timeout, stop}; }
 
     [[nodiscard]] auto send_to(
         net::socket&               sock,
@@ -578,16 +564,7 @@ public:
         std::span<const std::byte> buffer,
         std::chrono::milliseconds  timeout = std::chrono::milliseconds{0},
         std::stop_token            stop    = {}) -> operation<detail::async_op_kind::send_to>
-    {
-        return {
-            *this,
-            sock.native_handle(),
-            const_cast<std::byte*>(buffer.data()),
-            buffer.size(),
-            &endpoint,
-            timeout,
-            stop};
-    }
+    { return {*this, sock, const_cast<std::byte*>(buffer.data()), buffer.size(), &endpoint, timeout, stop}; }
 
     /**
      * Resumes execution of a direct coroutine handle on this io scheduler.
@@ -642,17 +619,6 @@ public:
     auto io_notifier() -> io_notifier& { return m_io_notifier; }
 
 private:
-#ifdef LIBCORO_FEATURE_NETWORKING
-    template<concepts::io_executor executor_type>
-    friend class net::dns::resolver;
-#endif
-
-    auto poll(
-        fd_t                      fd,
-        coro::poll_op             op,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
-        std::stop_token           stop    = {}) -> coro::task<poll_status>;
-
     /// The configuration options.
     options m_opts;
 
@@ -663,7 +629,7 @@ private:
     /// Whether scheduled operations have already requested an event loop wake-up.
     std::atomic<bool> m_schedule_triggered{false};
     /// @brief Scheduled operations waiting to be resumed.
-    std::atomic<schedule_operation*> m_scheduled_ops{nullptr};
+    std::atomic<schedule_operation*>      m_scheduled_ops{nullptr};
     std::atomic<detail::async_operation*> m_cancel_requests{nullptr};
     // Prevent the loop from completing an operation before its timer, registration and callback are published.
     std::mutex m_publication_mutex;

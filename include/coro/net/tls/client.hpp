@@ -73,11 +73,12 @@ public:
      * Attempts to asynchronously read data into the provided buffer.
      * The operation may read fewer bytes than requested; the returned span references the filled prefix.
      * @note Operations on the same client must not run concurrently.
-     * @see read_exact()
-     * @param buffer Destination buffer to read data into.
+     * @see coro::net::read_exact()
+     * @param buffer Destination buffer whose elements are one byte.
      * @param timeout Maximum time to wait for the read; zero waits indefinitely.
      * @param stop_token Requests cancellation of the operation.
      * @return The operation status and a span pointing to the read part of the buffer.
+     * Unexpected TCP EOF reports tls_error; authenticated TLS close_notify reports closed.
      */
     template<
         concepts::mutable_buffer buffer_type,
@@ -87,6 +88,8 @@ public:
         const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
         std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
     {
+        static_assert(sizeof(element_type) == 1);
+
         if (buffer.empty())
         {
             co_return {io_status{io_status::kind::ok}, {}};
@@ -97,39 +100,13 @@ public:
     }
 
     /**
-     * Asynchronously reads until the buffer is filled or an error, cancellation or timeout occurs.
-     * The timeout is a soft overall deadline for the entire operation.
-     * @note Operations on the same client must not run concurrently.
-     * @see read_some()
-     * @param buffer Destination buffer to read data into.
-     * @param timeout Maximum total time allowed; zero waits indefinitely.
-     * @param stop_token Requests cancellation, preserving any data already read.
-     * @return The operation status and a span pointing to the filled prefix, including on failure.
-     */
-    template<
-        concepts::mutable_buffer buffer_type,
-        typename element_type = typename concepts::mutable_buffer_traits<buffer_type>::element_type>
-    auto read_exact(
-        buffer_type&                    buffer,
-        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
-        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
-    {
-        if (buffer.empty())
-        {
-            co_return {io_status{io_status::kind::ok}, {}};
-        }
-        auto [status, buf] = co_await read_exact_impl(std::as_writable_bytes(std::span{buffer}), timeout, stop_token);
-        co_return {status, std::span<element_type>{reinterpret_cast<element_type*>(buf.data()), buf.size()}};
-    }
-
-    /**
      * Attempts to asynchronously write data from the provided buffer.
      * The returned span always refers to the unsent portion of the original buffer.
      * Plaintext accepted by SSL counts as sent even if flushing its ciphertext subsequently times out;
      * pending ciphertext is retained and flushed by the next operation.
      * @note Operations on the same client must not run concurrently.
-     * @see write_all()
-     * @param buffer Buffer containing the data to write.
+     * @see coro::net::write_all()
+     * @param buffer Source buffer whose elements are one byte.
      * @param timeout Maximum time to wait for the write; zero waits indefinitely.
      * @param stop_token Requests cancellation of the operation.
      * @return The operation status and a span pointing to the unsent portion; empty if all data was sent.
@@ -154,45 +131,12 @@ public:
     }
 
     /**
-     * Asynchronously writes until all plaintext is accepted or an error, cancellation or timeout occurs.
-     * The timeout is a soft overall deadline for the entire operation.
-     * Plaintext accepted by SSL counts as sent even if flushing its ciphertext subsequently times out;
-     * pending ciphertext is retained and flushed by the next operation.
-     * @note Operations on the same client must not run concurrently.
-     * @see write_some()
-     * @param buffer The data to write to the socket.
-     * @param timeout Maximum total time allowed; zero waits indefinitely.
-     * @param stop_token Requests cancellation, preserving the unsent portion of the buffer.
-     * @return The operation status and a span pointing to the unsent portion; empty if all data was sent.
-     */
-    template<
-        concepts::const_buffer buffer_type,
-        typename element_type = typename concepts::const_buffer_traits<buffer_type>::element_type>
-    auto write_all(
-        const buffer_type&              buffer,
-        const std::chrono::milliseconds timeout    = std::chrono::milliseconds{0},
-        std::stop_token                 stop_token = {}) -> coro::task<std::pair<io_status, std::span<element_type>>>
-    {
-        static_assert(sizeof(element_type) == 1);
-
-        if (buffer.empty())
-        {
-            co_return {io_status{io_status::kind::ok}, {}};
-        }
-        auto [status, buf] = co_await write_all_impl(std::as_bytes(std::span{buffer}), timeout, stop_token);
-        co_return {status, std::span<element_type>{reinterpret_cast<element_type*>(buf.data()), buf.size()}};
-    }
-
-    /**
      * Shuts down the tls client with a 30 second timeout.
      * Always co_await this before destroying the client: otherwise the destructor blocks on the shutdown, which
      * deadlocks when the destructor runs on the scheduler's event loop thread (see ~client()).
      * @return Task.
      */
-    auto shutdown() -> coro::task<void>
-    {
-        co_await shutdown(std::chrono::seconds{30});
-    }
+    auto shutdown() -> coro::task<void> { co_await shutdown(std::chrono::seconds{30}); }
 
     template<typename rep, typename period>
     auto shutdown(std::chrono::duration<rep, period> timeout) -> coro::task<void>
@@ -223,11 +167,6 @@ private:
         -> coro::task<std::pair<io_status, std::size_t>>;
     auto write_some_impl(std::span<const std::byte> buffer, deadline deadline, std::stop_token stop_token)
         -> coro::task<std::pair<io_status, std::size_t>>;
-    auto read_exact_impl(std::span<std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
-        -> coro::task<std::pair<io_status, std::span<std::byte>>>;
-    auto
-        write_all_impl(std::span<const std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
-            -> coro::task<std::pair<io_status, std::span<const std::byte>>>;
     auto tls_shutdown_and_free(std::chrono::milliseconds timeout) -> coro::task<void>;
 
     struct tls_deleter
@@ -263,7 +202,7 @@ private:
     coro::scheduler*                 m_scheduler{nullptr};
     std::shared_ptr<context>         m_tls_ctx{nullptr};
     net::socket_address              m_endpoint;
-    net::socket                      m_socket{-1};
+    net::socket                      m_socket{net::invalid_native_handle};
     std::optional<connection_status> m_connect_status{std::nullopt};
     tls_info                         m_tls_info{};
     std::atomic<bool>                m_shutdown{false};

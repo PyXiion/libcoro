@@ -34,14 +34,11 @@ if (LIBCORO_FEATURE_NETWORKING)
     list(APPEND LIBCORO_TEST_SOURCE_FILES
             net/test_ip_address.cpp
             net/test_io_status.cpp
+            net/test_io.cpp
+            net/test_dns_resolver.cpp
             net/test_endpoint.cpp
 
             net/catch_net_extensions.hpp
-    )
-
-    # These tests require coro::scheduler
-    list(APPEND LIBCORO_TEST_SOURCE_FILES
-            net/test_dns_resolver.cpp
             net/test_tcp_server.cpp
             net/test_tls_server.cpp
             net/test_udp_peers.cpp

@@ -14,8 +14,8 @@ namespace coro
 
 namespace detail
 {
-static auto
-    make_spawned_joinable_wait_task(std::unique_ptr<coro::task_group<coro::scheduler>> group_ptr) -> coro::task<void>
+static auto make_spawned_joinable_wait_task(std::unique_ptr<coro::task_group<coro::scheduler>> group_ptr)
+    -> coro::task<void>
 {
     co_await *group_ptr;
     co_return;
@@ -82,9 +82,7 @@ auto scheduler::spawn_joinable(coro::task<void>&& task) -> coro::task<void>
 }
 
 auto scheduler::schedule_at(time_point time) -> coro::task<void>
-{
-    return yield_until(time);
-}
+{ return yield_until(time); }
 
 auto scheduler::yield_until(time_point time) -> coro::task<void>
 {
@@ -98,12 +96,6 @@ auto scheduler::yield_until(time_point time) -> coro::task<void>
         co_await operation<detail::async_op_kind::timer>{
             *this, net::invalid_native_handle, nullptr, 0, nullptr, time - now, {}};
     }
-}
-
-auto scheduler::poll(fd_t fd, coro::poll_op op, std::chrono::milliseconds timeout, std::stop_token stop)
-    -> coro::task<poll_status>
-{
-    co_return co_await operation<detail::async_op_kind::poll>{*this, fd, nullptr, 0, nullptr, timeout, stop, op};
 }
 
 auto scheduler::resume(std::coroutine_handle<> handle) -> bool
@@ -304,17 +296,22 @@ auto scheduler::process_cancel_requests() -> void
     while (ops != nullptr)
     {
         auto* next = ops->m_next;
+        if (!(ops->m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed))
+        {
+            abort_op(
+                *ops,
+                ops->m_submit_error != 0 ? net::make_io_status_from_native(ops->m_submit_error)
+                                         : net::io_status{net::io_status::kind::cancelled});
+        }
         if (ops->m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed)
         {
             m_ops_to_finish.emplace_back(ops);
         }
         else
         {
-            abort_op(
-                *ops,
-                ops->m_submit_error != 0 ? net::make_io_status_from_native(ops->m_submit_error)
-                                         : net::io_status{net::io_status::kind::cancelled});
-            m_ops_to_finish.emplace_back(ops);
+            // The notifier still owns the operation. It has left the cancel list, so its completion finishes it.
+            ops->m_state.fetch_and(
+                static_cast<std::uint8_t>(~detail::async_operation::state_cancel_queued), std::memory_order::acq_rel);
         }
         ops = next;
     }
@@ -322,29 +319,17 @@ auto scheduler::process_cancel_requests() -> void
 
 auto scheduler::abort_op(detail::async_operation& op, net::io_status status) -> void
 {
-    if (op.m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed)
+    if (op.m_abort_requested ||
+        (op.m_state.load(std::memory_order::acquire) & detail::async_operation::state_completed))
     {
         return;
     }
-    if (op.m_kind != detail::async_op_kind::timer)
+    op.m_abort_requested = true;
+    op.m_status          = status;
+    // A completion-based notifier may still own the operation and completes it later, keeping this status if aborted.
+    if (op.m_kind != detail::async_op_kind::timer && !m_io_notifier.cancel(op))
     {
-        m_io_notifier.cancel(op);
-    }
-    op.m_status = status;
-    if (op.m_kind == detail::async_op_kind::poll)
-    {
-        switch (status.type)
-        {
-            case net::io_status::kind::timeout:
-                op.m_poll_status = poll_status::timeout;
-                break;
-            case net::io_status::kind::cancelled:
-                op.m_poll_status = poll_status::cancelled;
-                break;
-            default:
-                op.m_poll_status = poll_status::error;
-                break;
-        }
+        return;
     }
     mark_completed(op);
 }

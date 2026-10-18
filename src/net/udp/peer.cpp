@@ -39,19 +39,8 @@ auto peer::operator=(peer&& other) noexcept -> peer&
     if (std::addressof(other) != this)
     {
         m_scheduler = std::exchange(other.m_scheduler, nullptr);
-        m_socket       = std::move(other.m_socket);
-        m_bound        = other.m_bound;
-    }
-    return *this;
-}
-
-auto peer::operator=(const peer& other) noexcept -> peer&
-{
-    if (std::addressof(other) != this)
-    {
-        m_scheduler = other.m_scheduler;
-        m_socket       = other.m_socket;
-        m_bound        = other.m_bound;
+        m_socket    = std::move(other.m_socket);
+        m_bound     = other.m_bound;
     }
     return *this;
 }

@@ -15,9 +15,9 @@ TEST_CASE("tls_server hello world server", "[tls_server]")
     auto scheduler =
         coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
 
-    const std::string client_msg = "Hello world from TLS client!";
-    const std::string server_msg = "Hello world from TLS server!!";
-    const auto        endpoint   = coro::net::socket_address{"127.0.0.1", 8080};
+    const std::string      client_msg = "Hello world from TLS client!";
+    const std::string      server_msg = "Hello world from TLS server!!";
+    const auto             endpoint   = coro::net::socket_address{"127.0.0.1", 8080};
     coro::net::tls::server server{
         scheduler,
         std::make_shared<coro::net::tls::context>(
@@ -33,12 +33,12 @@ TEST_CASE("tls_server hello world server", "[tls_server]")
         auto cstatus = co_await client.connect(std::chrono::seconds{5});
         REQUIRE(cstatus == coro::net::tls::connection_status::connected);
 
-        auto [sstatus, remaining] = co_await client.write_all(client_msg, std::chrono::seconds{5});
+        auto [sstatus, remaining] = co_await coro::net::write_all(client, client_msg, std::chrono::seconds{5});
         REQUIRE(sstatus.is_ok());
         REQUIRE(remaining.empty());
 
         std::string response(server_msg.size(), '\0');
-        auto [rstatus, rspan] = co_await client.read_exact(response, std::chrono::seconds{5});
+        auto [rstatus, rspan] = co_await coro::net::read_exact(client, response, std::chrono::seconds{5});
         REQUIRE(rstatus.is_ok());
         REQUIRE(rspan.size() == server_msg.size());
         REQUIRE(response == server_msg);
@@ -53,12 +53,12 @@ TEST_CASE("tls_server hello world server", "[tls_server]")
         REQUIRE(client->socket().is_ok());
 
         std::string buffer(client_msg.size(), '\0');
-        auto [rstatus, rspan] = co_await client->read_exact(buffer, std::chrono::seconds{5});
+        auto [rstatus, rspan] = co_await coro::net::read_exact(*client, buffer, std::chrono::seconds{5});
         REQUIRE(rstatus.is_ok());
         REQUIRE(rspan.size() == client_msg.size());
         REQUIRE(buffer == client_msg);
 
-        auto [sstatus, remaining] = co_await client->write_all(server_msg, std::chrono::seconds{5});
+        auto [sstatus, remaining] = co_await coro::net::write_all(*client, server_msg, std::chrono::seconds{5});
         REQUIRE(sstatus.is_ok());
         REQUIRE(remaining.empty());
         co_await client->shutdown(std::chrono::seconds{5});
@@ -92,10 +92,10 @@ TEST_CASE("tls_server read timeout preserves connection", "[tls_server]")
         REQUIRE(timeout_status.is_timeout());
         REQUIRE(empty.empty());
 
-        auto [write_status, remaining] = co_await client.write_all(message, std::chrono::seconds{5});
+        auto [write_status, remaining] = co_await coro::net::write_all(client, message, std::chrono::seconds{5});
         REQUIRE(write_status.is_ok());
         REQUIRE(remaining.empty());
-        auto [read_status, received] = co_await client.read_exact(buffer, std::chrono::seconds{5});
+        auto [read_status, received] = co_await coro::net::read_exact(client, buffer, std::chrono::seconds{5});
         REQUIRE(read_status.is_ok());
         REQUIRE(received.size() == message.size());
         REQUIRE(buffer == message);
@@ -110,11 +110,11 @@ TEST_CASE("tls_server read timeout preserves connection", "[tls_server]")
 
         // Send nothing until the client has timed out and sends its request.
         std::string buffer(message.size(), '\0');
-        auto [read_status, received] = co_await client->read_exact(buffer, std::chrono::seconds{5});
+        auto [read_status, received] = co_await coro::net::read_exact(*client, buffer, std::chrono::seconds{5});
         REQUIRE(read_status.is_ok());
         REQUIRE(received.size() == message.size());
         REQUIRE(buffer == message);
-        auto [write_status, remaining] = co_await client->write_all(buffer, std::chrono::seconds{5});
+        auto [write_status, remaining] = co_await coro::net::write_all(*client, buffer, std::chrono::seconds{5});
         REQUIRE(write_status.is_ok());
         REQUIRE(remaining.empty());
         co_await client->shutdown(std::chrono::seconds{5});
@@ -209,6 +209,73 @@ TEST_CASE("tls_server cancels pending read", "[tls_server]")
         REQUIRE(client.has_value());
         co_await read_finished;
         co_await client->shutdown(std::chrono::seconds{5});
+    };
+
+    coro::sync_wait(coro::when_all(make_server_task(), make_client_task()));
+}
+
+TEST_CASE("tls_server rejects unauthenticated EOF", "[tls_server]")
+{
+    using namespace std::chrono_literals;
+    const bool exact = GENERATE(false, true);
+    auto       scheduler =
+        coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
+    coro::net::tls::server server{
+        scheduler,
+        std::make_shared<coro::net::tls::context>(
+            "cert.pem", coro::net::tls::tls_file_type::pem, "key.pem", coro::net::tls::tls_file_type::pem),
+        {"127.0.0.1", 0}};
+    auto endpoint          = coro::net::socket_address::make_uninitialised();
+    auto [address, length] = endpoint.native_mutable_data();
+    REQUIRE(::getsockname(server.accept_socket().native_handle(), address, length) == 0);
+    const std::string message = "authenticated prefix";
+    coro::event       read_finished;
+
+    auto make_client_task = [&]() -> coro::task<void>
+    {
+        co_await scheduler->schedule();
+        coro::net::tls::client client{
+            scheduler, std::make_shared<coro::net::tls::context>(coro::net::tls::verify_peer_t::no), endpoint};
+        REQUIRE(co_await client.connect(5s) == coro::net::tls::connection_status::connected);
+
+        std::string          buffer(message.size() + 1, '\0');
+        coro::net::io_status status;
+        std::size_t          bytes_read{0};
+        if (exact)
+        {
+            auto [read_status, received] = co_await coro::net::read_exact(client, buffer, 5s);
+            status                       = read_status;
+            bytes_read                   = received.size();
+        }
+        else
+        {
+            auto prefix                  = std::span{buffer}.first(message.size());
+            auto [read_status, received] = co_await coro::net::read_exact(client, prefix, 5s);
+            CHECK(read_status.is_ok());
+            bytes_read                   = received.size();
+            auto tail                    = std::span{buffer}.last(1);
+            auto [end_status, remaining] = co_await client.read_some(tail, 5s);
+            status                       = end_status;
+            bytes_read += remaining.size();
+        }
+        read_finished.set();
+        co_await client.shutdown(1s);
+
+        CHECK(status.type == coro::net::io_status::kind::tls_error);
+        CHECK(bytes_read == message.size());
+        CHECK(std::string_view{buffer.data(), bytes_read} == message);
+    };
+    auto make_server_task = [&]() -> coro::task<void>
+    {
+        co_await scheduler->schedule();
+        auto client = co_await server.accept(5s, 5s);
+        REQUIRE(client.has_value());
+        auto [status, remaining] = co_await coro::net::write_all(*client, message, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(remaining.empty());
+        REQUIRE(client->socket().shutdown(coro::net::socket::shutdown_how::write));
+        co_await read_finished;
+        co_await client->shutdown(1s);
     };
 
     coro::sync_wait(coro::when_all(make_server_task(), make_client_task()));

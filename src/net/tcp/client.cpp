@@ -16,7 +16,7 @@ client::client(std::unique_ptr<coro::scheduler>& scheduler, net::socket_address 
     }
 }
 
-client::client(coro::scheduler* scheduler, net::socket socket, const net::socket_address &endpoint)
+client::client(coro::scheduler* scheduler, net::socket socket, const net::socket_address& endpoint)
     : m_scheduler(scheduler),
       m_endpoint(std::move(endpoint)),
       m_socket(std::move(socket)),
@@ -26,14 +26,6 @@ client::client(coro::scheduler* scheduler, net::socket socket, const net::socket
 
     // Force the socket to be non-blocking.
     m_socket.blocking(coro::net::socket::blocking_t::no);
-}
-
-client::client(const client& other)
-    : m_scheduler(other.m_scheduler),
-      m_endpoint(other.m_endpoint),
-      m_socket(other.m_socket),
-      m_connect_status(other.m_connect_status)
-{
 }
 
 client::client(client&& other) noexcept
@@ -48,23 +40,11 @@ client::~client()
 {
 }
 
-auto client::operator=(const client& other) noexcept -> client&
-{
-    if (std::addressof(other) != this)
-    {
-        m_scheduler   = other.m_scheduler;
-        m_endpoint       = other.m_endpoint;
-        m_socket         = other.m_socket;
-        m_connect_status = other.m_connect_status;
-    }
-    return *this;
-}
-
 auto client::operator=(client&& other) noexcept -> client&
 {
     if (std::addressof(other) != this)
     {
-        m_scheduler   = std::exchange(other.m_scheduler, nullptr);
+        m_scheduler      = std::exchange(other.m_scheduler, nullptr);
         m_endpoint       = std::move(other.m_endpoint);
         m_socket         = std::move(other.m_socket);
         m_connect_status = std::exchange(other.m_connect_status, std::nullopt);

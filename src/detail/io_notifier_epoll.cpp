@@ -117,9 +117,7 @@ auto io_notifier_epoll::watch(fd_t fd, poll_op op, void* data, bool keep) -> boo
 }
 
 auto io_notifier_epoll::try_now(async_operation& op) -> bool
-{
-    return perform_posix(op);
-}
+{ return perform_posix(op); }
 
 auto io_notifier_epoll::submit(async_operation& op) -> bool
 {
@@ -132,13 +130,9 @@ auto io_notifier_epoll::submit(async_operation& op) -> bool
     return true;
 }
 
-auto io_notifier_epoll::complete_ready(async_operation& op, poll_status status) -> bool
+auto io_notifier_epoll::complete_ready(async_operation& op, poll_status) -> bool
 {
-    if (op.m_kind == async_op_kind::poll)
-    {
-        op.m_poll_status = status;
-    }
-    else if (!perform_posix(op))
+    if (!perform_posix(op))
     {
         auto event_data     = event_t{};
         event_data.events   = poll_op_to_events(operation_poll_op(op)) | EPOLLONESHOT | EPOLLRDHUP;
@@ -153,19 +147,18 @@ auto io_notifier_epoll::complete_ready(async_operation& op, poll_status status) 
     return true;
 }
 
-auto io_notifier_epoll::cancel(async_operation& op) -> void
+auto io_notifier_epoll::cancel(async_operation& op) -> bool
 {
     if (op.m_registered)
     {
         unwatch(op.m_fd, operation_poll_op(op));
         op.m_registered = false;
     }
+    return true;
 }
 
 auto io_notifier_epoll::unwatch(fd_t fd, poll_op) -> bool
-{
-    return ::epoll_ctl(m_fd, EPOLL_CTL_DEL, fd, nullptr) != -1;
-}
+{ return ::epoll_ctl(m_fd, EPOLL_CTL_DEL, fd, nullptr) != -1; }
 
 auto io_notifier_epoll::unwatch_timer(const timer_handle& timer) -> bool
 {

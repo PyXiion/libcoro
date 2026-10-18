@@ -2,35 +2,85 @@
 
 #include "coro/concepts/executor.hpp"
 #include "coro/event.hpp"
-#include "coro/fd.hpp"
+#include "coro/net/detail/socket_api.hpp"
 #include "coro/net/hostname.hpp"
 #include "coro/net/ip_address.hpp"
-#include "coro/poll.hpp"
 #include "coro/task.hpp"
 
 #include <ares.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 
-#include <array>
-#include <chrono>
-#include <functional>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace coro::net::dns
 {
 namespace detail
 {
-/// Global count to track if c-ares has been initialized or cleaned up.
-static uint64_t m_ares_count;
-/// Critical section around the c-ares global init/cleanup to prevent heap corruption.
-static std::mutex m_ares_mutex;
+// One library lifetime shared by every resolver specialization and translation unit.
+class ares_library_guard
+{
+public:
+    ares_library_guard()
+    {
+        std::scoped_lock lock{m_mutex};
+        if (m_count == 0)
+        {
+            if (!ares_threadsafety())
+            {
+                throw std::runtime_error{"dns resolver requires c-ares thread support"};
+            }
+#if defined(CORO_PLATFORM_WINDOWS)
+            WSADATA    data{};
+            const auto error = WSAStartup(MAKEWORD(2, 2), &data);
+            if (error != 0)
+            {
+                throw std::system_error{error, std::system_category(), "dns resolver WSAStartup"};
+            }
+#endif
+            const auto status = ares_library_init(ARES_LIB_INIT_ALL);
+            if (status != ARES_SUCCESS)
+            {
+#if defined(CORO_PLATFORM_WINDOWS)
+                WSACleanup();
+#endif
+                throw std::runtime_error{ares_strerror(status)};
+            }
+        }
+        ++m_count;
+    }
+
+    ares_library_guard(const ares_library_guard&)                    = delete;
+    ares_library_guard(ares_library_guard&&)                         = delete;
+    auto operator=(const ares_library_guard&) -> ares_library_guard& = delete;
+    auto operator=(ares_library_guard&&) -> ares_library_guard&      = delete;
+
+    ~ares_library_guard()
+    {
+        std::scoped_lock lock{m_mutex};
+        if (--m_count == 0)
+        {
+            ares_library_cleanup();
+#if defined(CORO_PLATFORM_WINDOWS)
+            WSACleanup();
+#endif
+        }
+    }
+
+private:
+    inline static std::mutex  m_mutex{};
+    inline static std::size_t m_count{0};
+};
 } // namespace detail
 
-template<concepts::io_executor executor_type>
+template<concepts::executor executor_type>
 class resolver;
 
 enum class status
@@ -39,72 +89,42 @@ enum class status
     error
 };
 
-template<concepts::io_executor executor_type>
 class result
 {
-    friend resolver<executor_type>;
+    template<concepts::executor executor_type>
+    friend class resolver;
 
 public:
-    result(std::unique_ptr<executor_type>& executor, coro::event& resume, uint64_t pending_dns_requests)
-        : m_executor(executor),
-          m_resume(resume),
-          m_pending_dns_requests(pending_dns_requests)
-    {
-    }
-    ~result() = default;
+    [[nodiscard]] auto is_ok() const noexcept -> bool { return m_status == dns::status::complete; }
 
-    /**
-     * @return The status of the dns lookup.
-     */
-    auto status() const -> dns::status { return m_status; }
+    [[nodiscard]] auto is_error() const noexcept -> bool { return m_status == dns::status::error; }
 
-    /**
-     * @return If the result of the dns looked was successful then the list of ip addresses that
-     *         were resolved from the hostname.
-     */
-    auto ip_addresses() const -> const std::vector<coro::net::ip_address>& { return m_ip_addresses; }
+    explicit operator bool() const noexcept { return is_ok(); }
+
+    [[nodiscard]] auto status() const noexcept -> dns::status { return m_status; }
+
+    [[nodiscard]] auto ip_addresses() const noexcept -> const std::vector<net::ip_address>& { return m_ip_addresses; }
 
 private:
-    std::unique_ptr<executor_type>&    m_executor;
-    coro::event&                       m_resume;
-    uint64_t                           m_pending_dns_requests{0};
-    dns::status                        m_status{dns::status::complete};
-    std::vector<coro::net::ip_address> m_ip_addresses{};
-
-    friend auto ares_dns_callback(void* arg, int status, int timeouts, ares_addrinfo* addr_info) -> void;
+    dns::status                  m_status{dns::status::error};
+    std::vector<net::ip_address> m_ip_addresses{};
 };
 
-template<concepts::io_executor executor_type>
+template<concepts::executor executor_type>
 class resolver
 {
 public:
-    explicit resolver(std::unique_ptr<executor_type>& executor, std::chrono::milliseconds timeout)
-        : m_executor(executor),
-          m_timeout(timeout)
+    explicit resolver(std::unique_ptr<executor_type>& executor) : m_executor(executor)
     {
         if (m_executor == nullptr)
         {
             throw std::runtime_error{"dns resolver cannot have nullptr executor"};
         }
 
-        {
-            std::scoped_lock g{detail::m_ares_mutex};
-            if (detail::m_ares_count == 0)
-            {
-                auto ares_status = ares_library_init(ARES_LIB_INIT_ALL);
-                if (ares_status != ARES_SUCCESS)
-                {
-                    throw std::runtime_error{ares_strerror(ares_status)};
-                }
-            }
-            ++detail::m_ares_count;
-        }
-
         ares_options options{};
-        options.sock_state_cb      = resolver::ares_socket_state_callback;
-        options.sock_state_cb_data = this;
+        options.evsys = ARES_EVSYS_DEFAULT;
 
-        auto channel_init_status = ares_init_options(&m_ares_channel, &options, ARES_OPT_SOCK_STATE_CB);
+        const auto channel_init_status = ares_init_options(&m_ares_channel, &options, ARES_OPT_EVENT_THREAD);
         if (channel_init_status != ARES_SUCCESS)
         {
             throw std::runtime_error{ares_strerror(channel_init_status)};
@@ -123,24 +143,18 @@ public:
             ares_destroy(m_ares_channel);
             m_ares_channel = nullptr;
         }
-
-        {
-            std::scoped_lock g{detail::m_ares_mutex};
-            --detail::m_ares_count;
-            if (detail::m_ares_count == 0)
-            {
-                ares_library_cleanup();
-            }
-        }
     }
 
     /**
-     * @param hn The hostname to resolve its ip addresses.
+     * Resolves the hostname to IP addresses and returns owned lookup data.
+     * The hostname is owned by the task, including before it is first awaited.
+     * Keep each started task frame alive until completion. The resolver, executor, and
+     * unique_ptr owning the executor must outlive every started lookup; do not reset that owner
+     * or shut down the executor while a lookup is pending.
      */
-    auto host_by_name(const net::hostname& hn) -> coro::task<std::unique_ptr<result<executor_type>>>
+    auto host_by_name(net::hostname hn) -> coro::task<dns::result>
     {
-        coro::event resume_event{};
-        auto        result_ptr = std::make_unique<result<executor_type>>(m_executor, resume_event, 1);
+        request_state request{m_executor};
 
         ares_addrinfo_hints hints{};
         hints.ai_family = AF_UNSPEC; // Request both IPv4 and IPv6
@@ -151,137 +165,76 @@ public:
             nullptr, // service name (port number or NULL)
             &hints,
             ares_dns_callback,
-            result_ptr.get());
+            &request);
 
-        // Suspend until this specific result is completed by ares.
-        co_await resume_event;
-        co_return result_ptr;
+        co_await request.m_resume;
+        if (request.m_exception != nullptr)
+        {
+            std::rethrow_exception(request.m_exception);
+        }
+        co_return std::move(request.m_result);
     }
 
 private:
-    /// The executor to drive the events for dns lookups.
+    struct request_state
+    {
+        std::unique_ptr<executor_type>& m_executor;
+        coro::event                     m_resume{};
+        dns::result                     m_result{};
+        std::exception_ptr              m_exception{};
+    };
+
+    /// Executor used to resume lookups completed by the c-ares event thread.
     std::unique_ptr<executor_type>& m_executor;
 
-    /// The global timeout per dns lookup request.
-    std::chrono::milliseconds m_timeout{0};
+    detail::ares_library_guard m_library{};
 
     /// The libc-ares channel for looking up dns entries.
     ares_channel m_ares_channel{nullptr};
 
-    /// This is the map of sockets that are currently being actively polled so multiple poll tasks
-    /// are not setup when socket state is changed.
-    std::unordered_map<fd_t, poll_op> m_active_sockets{};
-
-    auto make_poll_task(fd_t fd) -> coro::task<void>
+    static auto ares_dns_callback(void* arg, int status, int /*timeouts*/, ares_addrinfo* addr_info) noexcept -> void
     {
-        // The loop ensures non-blocking polling until the socket is closed by c-ares.
-        while (m_active_sockets.contains(fd))
+        auto& request = *static_cast<request_state*>(arg);
+        auto& result  = request.m_result;
+
+        try
         {
-            auto ops    = m_active_sockets[fd];
-            auto result = co_await m_executor->poll(fd, ops, m_timeout);
-            switch (result)
+            if (addr_info != nullptr && status == ARES_SUCCESS)
             {
-                case poll_status::read:
-                    ares_process_fd(m_ares_channel, fd, ARES_SOCKET_BAD);
-                    break;
-                case poll_status::write:
-                    ares_process_fd(m_ares_channel, ARES_SOCKET_BAD, fd);
-                    break;
-
-                case poll_status::timeout:
-                    ares_process_fd(m_ares_channel, ARES_SOCKET_BAD, ARES_SOCKET_BAD);
-                    break;
-                case poll_status::closed:
-                    // might need to do something like call with two ARES_SOCKET_BAD?
-                    m_active_sockets.erase(fd);
-                    break;
-                case poll_status::error:
-                    // might need to do something like call with two ARES_SOCKET_BAD?
-                    m_active_sockets.erase(fd);
-                    break;
-                case poll_status::cancelled:
-                    m_active_sockets.erase(fd);
-                    break;
-            }
-        }
-
-        co_return;
-    }
-
-    static auto ares_socket_state_callback(void* data, ares_socket_t socket_fd, int readable, int writable) -> void
-    {
-        resolver* self = static_cast<resolver*>(data);
-        uint64_t  ops{0};
-
-        if (readable)
-        {
-            ops |= static_cast<uint64_t>(poll_op::read);
-        }
-        if (writable)
-        {
-            ops |= static_cast<uint64_t>(poll_op::write);
-        }
-
-        auto fd       = static_cast<fd_t>(socket_fd);
-        auto poll_ops = static_cast<poll_op>(ops);
-        if (ops != 0)
-        {
-            auto [it, inserted] = self->m_active_sockets.insert_or_assign(fd, poll_ops);
-            if (inserted)
-            {
-                self->m_executor->spawn_detached(self->make_poll_task(fd));
-            }
-        }
-        else
-        {
-            self->m_active_sockets.erase(fd);
-        }
-    }
-
-    static auto ares_dns_callback(void* arg, int status, int /*timeouts*/, ares_addrinfo* addr_info) -> void
-    {
-        auto& result = *static_cast<coro::net::dns::result<executor_type>*>(arg);
-        --result.m_pending_dns_requests;
-
-        if (addr_info == nullptr || status != ARES_SUCCESS)
-        {
-            result.m_status = status::error;
-        }
-        else
-        {
-            result.m_status = status::complete;
-
-            for (ares_addrinfo_node* node = addr_info->nodes; node != nullptr; node = node->ai_next)
-            {
-                if (node->ai_family == AF_INET)
+                for (const auto* node = addr_info->nodes; node != nullptr; node = node->ai_next)
                 {
-                    sockaddr_in*    sin = reinterpret_cast<sockaddr_in*>(node->ai_addr);
-                    net::ip_address ip_addr{
-                        std::span<const uint8_t>{
-                            reinterpret_cast<const uint8_t*>(&sin->sin_addr), net::ip_address::ipv4_len},
-                        static_cast<net::domain_t>(AF_INET)};
-
-                    result.m_ip_addresses.emplace_back(std::move(ip_addr));
+                    if (node->ai_family == AF_INET)
+                    {
+                        const auto* address = reinterpret_cast<const sockaddr_in*>(node->ai_addr);
+                        result.m_ip_addresses.emplace_back(
+                            std::span<const uint8_t>{
+                                reinterpret_cast<const uint8_t*>(&address->sin_addr), net::ip_address::ipv4_len},
+                            net::domain_t::ipv4);
+                    }
+                    else if (node->ai_family == AF_INET6)
+                    {
+                        const auto* address = reinterpret_cast<const sockaddr_in6*>(node->ai_addr);
+                        result.m_ip_addresses.emplace_back(
+                            std::span<const uint8_t>{
+                                reinterpret_cast<const uint8_t*>(&address->sin6_addr), net::ip_address::ipv6_len},
+                            net::domain_t::ipv6);
+                    }
                 }
-                else if (node->ai_family == AF_INET6)
-                {
-                    sockaddr_in6*   sin6 = reinterpret_cast<sockaddr_in6*>(node->ai_addr);
-                    net::ip_address ip_addr{
-                        std::span<const uint8_t>{
-                            reinterpret_cast<const uint8_t*>(&sin6->sin6_addr), net::ip_address::ipv6_len},
-                        static_cast<net::domain_t>(AF_INET6)};
-
-                    result.m_ip_addresses.emplace_back(std::move(ip_addr));
-                }
+                result.m_status = dns::status::complete;
             }
-
+        }
+        catch (...)
+        {
+            // No C++ exception may escape through c-ares' C callback.
+            request.m_exception = std::current_exception();
+        }
+        if (addr_info != nullptr)
+        {
             ares_freeaddrinfo(addr_info);
         }
 
-        if (result.m_pending_dns_requests == 0)
-        {
-            result.m_resume.set(result.m_executor, resume_order_policy::lifo);
-        }
+        // Resumption may destroy request; do not access it after signaling.
+        request.m_resume.set(request.m_executor, resume_order_policy::lifo);
     }
 };
 

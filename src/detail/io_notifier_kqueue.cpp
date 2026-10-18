@@ -19,9 +19,7 @@ namespace coro::detail
 {
 
 static auto poll_op_to_filter(poll_op op) -> int16_t
-{
-    return op == poll_op::read ? EVFILT_READ : EVFILT_WRITE;
-}
+{ return op == poll_op::read ? EVFILT_READ : EVFILT_WRITE; }
 
 io_notifier_kqueue::io_notifier_kqueue() : m_fd{::kqueue()}
 {
@@ -88,9 +86,7 @@ auto io_notifier_kqueue::watch(fd_t fd, poll_op op, void* data, bool keep) -> bo
 }
 
 auto io_notifier_kqueue::try_now(async_operation& op) -> bool
-{
-    return perform_posix(op);
-}
+{ return perform_posix(op); }
 
 auto io_notifier_kqueue::submit(async_operation& op) -> bool
 {
@@ -105,13 +101,9 @@ auto io_notifier_kqueue::submit(async_operation& op) -> bool
     return true;
 }
 
-auto io_notifier_kqueue::complete_ready(async_operation& op, poll_status status) -> bool
+auto io_notifier_kqueue::complete_ready(async_operation& op, poll_status) -> bool
 {
-    if (op.m_kind == async_op_kind::poll)
-    {
-        op.m_poll_status = status;
-    }
-    else if (!perform_posix(op))
+    if (!perform_posix(op))
     {
         if (watch(op.m_fd, operation_poll_op(op), &op))
         {
@@ -123,13 +115,14 @@ auto io_notifier_kqueue::complete_ready(async_operation& op, poll_status status)
     return true;
 }
 
-auto io_notifier_kqueue::cancel(async_operation& op) -> void
+auto io_notifier_kqueue::cancel(async_operation& op) -> bool
 {
     if (op.m_registered)
     {
         unwatch(op.m_fd, operation_poll_op(op));
         op.m_registered = false;
     }
+    return true;
 }
 
 auto io_notifier_kqueue::unwatch(fd_t fd, poll_op op) -> bool
@@ -182,8 +175,8 @@ auto io_notifier_kqueue::next_events(
     auto       ready_set       = std::array<event_t, m_max_events>{};
     const auto timeout_as_secs = std::chrono::duration_cast<std::chrono::seconds>(timeout);
     auto       timeout_spec    = ::timespec{
-                 .tv_sec  = timeout_as_secs.count(),
-                 .tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - timeout_as_secs).count(),
+        .tv_sec  = timeout_as_secs.count(),
+        .tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout - timeout_as_secs).count(),
     };
     const int num_ready =
         ::kevent(m_fd, nullptr, 0, ready_set.data(), ready_set.size(), timeout.count() < 0 ? nullptr : &timeout_spec);

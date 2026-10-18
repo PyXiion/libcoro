@@ -7,7 +7,8 @@
 #if defined(__linux__)
     #define CORO_PLATFORM_LINUX 1
     #define CORO_PLATFORM_UNIX  1
-#elif defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#elif defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__NetBSD__) ||                     \
+    defined(__DragonFly__)
     #define CORO_PLATFORM_BSD  1
     #define CORO_PLATFORM_UNIX 1
 #elif defined(_WIN32)

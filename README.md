@@ -36,7 +36,7 @@
         - Requires `LIBCORO_FEATURE_NETWORKING` to be supported.
     - coro::task_group for grouping dynamic lifetime tasks
 * Coroutine Networking
-    - coro::net::dns::resolver for async dns
+    - [coro::net::dns::resolver](#dns_resolver) for async DNS
         - Uses libc-ares
     - [coro::net::tcp::client](#scheduler)
     - [coro::net::tcp::server](#scheduler)
@@ -1225,6 +1225,12 @@ The `coro::scheduler` can use a dedicated spawned thread for processing events t
 * `coro::scheduler::spawn_joinable(coro::task<void>&& task) -> coro::task<void>` Spawns the task to be started immediately but can be joined at later time, use this if you want to start the task immediately but want to join it later.
 * `coro::task_group<coro::scheduler>(coro::task<void>&& task | range<coro::task<void>>)` schedules the task(s) on the `coro::scheduler`. Use this when you want to share a `coro::scheduler` while monitoring the progress of a subset of tasks.
 
+TCP and TLS clients provide `read_some()` and `write_some()` primitives. Include `<coro/net/io.hpp>`
+(also exported by `<coro/coro.hpp>`) for the shared `coro::net::read_exact(client, buffer, timeout, stop_token)`
+and `coro::net::write_all(client, buffer, timeout, stop_token)` algorithms. Both use one soft overall timeout
+and preserve the received prefix or unsent suffix on failure. Buffers must have one-byte elements;
+a zero or negative timeout waits indefinitely.
+
 The example provided here shows an i/o scheduler that spins up a basic `coro::net::tcp::server` and a `coro::net::tcp::client` that will connect to each other and then send a request and a response.
 
 ```C++
@@ -1293,7 +1299,7 @@ int main()
 
         // Send the server response to the client.
         std::string response        = "Hello from server.";
-        auto [write_status, unsent] = co_await client->write_all(response);
+        auto [write_status, unsent] = co_await coro::net::write_all(*client, response);
         if (!write_status.is_ok())
         {
             std::cout << "server error: " << write_status.message() << "\n";
@@ -1318,7 +1324,7 @@ int main()
         co_await client.connect();
 
         // Send the request data.
-        co_await client.write_all(std::string_view{"Hello from client."});
+        co_await coro::net::write_all(client, std::string_view{"Hello from client."});
 
         // Wait for the response and receive it.
         std::string response(256, '\0');
@@ -1346,6 +1352,32 @@ scheduler::thread_pool worker 0 stopping
 scheduler::thread_pool worker 1 stopping
 scheduler::process event thread stop
 ```
+
+### dns_resolver
+
+`coro::net::dns::resolver` returns an owning `coro::net::dns::result` by value.
+Use `is_ok()`, `is_error()` or an explicit boolean conversion to check the result.
+`status()` remains available for inspecting the DNS status.
+The resolver runs c-ares on its own event thread, so it works on every supported platform, including Windows.
+
+Construct a resolver with `coro::net::dns::resolver resolver{scheduler};`. The executor only resumes the
+lookup coroutines; c-ares drives its own sockets. Keep the resolver alive, and keep the `std::unique_ptr`
+owning the executor alive, until every started lookup has finished.
+Inside a coroutine:
+
+```C++
+auto result = co_await resolver.host_by_name(coro::net::hostname{"example.com"});
+if (result.is_ok())
+{
+    for (const auto& address : result.ip_addresses())
+    {
+        std::cout << address.to_string() << "\n";
+    }
+}
+```
+
+The returned result contains only status and addresses; it does not retain the executor or completion event.
+The lookup task owns its hostname, so it can also be stored and awaited later.
 
 ### tcp_echo_server
 See [examples/coro_tcp_echo_erver.cpp](./examples/coro_tcp_echo_server.cpp) for a basic TCP echo server implementation.  You can use tools like `ab` to benchmark against this echo server.
@@ -1512,9 +1544,6 @@ If you require TLS, provide OpenSSL for the target ABI (static or shared) and se
         g++ [11, 12, 13]
         clang++ [16, 17]
         MSVC Windows 2022 CL
-            Does not currently support:
-                `LIBCORO_FEATURE_NETWORKING`
-                `LIBCORO_FEATURE_TLS`
     CMake
     make or ninja
     pthreads
@@ -1531,9 +1560,9 @@ Full feature supported operating systems:
  * fedora:37-43
  * MacOS 15
  * openSUSE/leap:15.6
+ * Windows 2022
 
 The following systems currently do not support `LIBCORO_FEATURE_NETWORKING` or `LIBCORO_FEATURE_TLS`:
- * Windows 2022
  * Emscripten 3.1.45
 
 #### Possible issues
@@ -1575,8 +1604,8 @@ CMake Options:
 | LIBCORO_BUILD_TESTS           | ON      | Should the tests be built? Note this is only default ON if libcoro is the root CMakeLists.txt      |
 | LIBCORO_CODE_COVERAGE         | OFF     | Should code coverage be enabled? Requires tests to be enabled.                                     |
 | LIBCORO_BUILD_EXAMPLES        | ON      | Should the examples be built? Note this is only default ON if libcoro is the root CMakeLists.txt   |
-| LIBCORO_FEATURE_NETWORKING    | ON      | Include networking features. MSVC not currently supported                                          |
-| LIBCORO_FEATURE_TLS           | ON      | Include TLS features. Requires networking to be enabled. MSVC not currently supported.             |
+| LIBCORO_FEATURE_NETWORKING    | ON      | Include networking features.                                                                        |
+| LIBCORO_FEATURE_TLS           | ON      | Include TLS features. Requires networking to be enabled. Requires OpenSSL.                           |
 
 #### Adding to your project
 

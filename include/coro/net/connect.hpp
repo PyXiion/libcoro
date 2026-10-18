@@ -12,7 +12,7 @@ enum class connect_status
     invalid_ip_address,
     /// The connection operation timed out.
     timeout,
-    /// There was an error, use errno to get more information on the specific error.
+    /// There was an error establishing the connection.
     error
 };
 

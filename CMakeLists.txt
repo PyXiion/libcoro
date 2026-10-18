@@ -71,8 +71,8 @@ if (LIBCORO_RUN_GITCONFIG)
     )
 endif()
 
-cmake_dependent_option(LIBCORO_FEATURE_NETWORKING "Include networking features, Default=ON." ON "NOT EMSCRIPTEN; NOT MSVC" OFF)
-cmake_dependent_option(LIBCORO_FEATURE_TLS "Include TLS encryption features, Default=ON." ON "NOT EMSCRIPTEN; NOT MSVC" OFF)
+cmake_dependent_option(LIBCORO_FEATURE_NETWORKING "Include networking features, Default=ON." ON "NOT EMSCRIPTEN" OFF)
+cmake_dependent_option(LIBCORO_FEATURE_TLS "Include TLS encryption features, Default=ON." ON "NOT EMSCRIPTEN" OFF)
 
 message(STATUS "LIBCORO_ENABLE_ASAN           = ${LIBCORO_ENABLE_ASAN}")
 message(STATUS "LIBCORO_ENABLE_MSAN           = ${LIBCORO_ENABLE_MSAN}")
@@ -89,7 +89,7 @@ message(STATUS "LIBCORO_BUILD_SHARED_LIBS     = ${LIBCORO_BUILD_SHARED_LIBS}")
 
 if(LIBCORO_EXTERNAL_DEPENDENCIES)
     if(LIBCORO_FEATURE_NETWORKING)
-        find_package(c-ares CONFIG REQUIRED)
+        find_package(c-ares 1.26 CONFIG REQUIRED)
     endif()
 else()
     if(NOT LIBCORO_BUILD_TESTS)
@@ -100,8 +100,16 @@ else()
         set(CARES_STATIC    $<NOT:${LIBCORO_BUILD_SHARED_LIBS}> CACHE INTERNAL "")
         set(CARES_SHARED    ${LIBCORO_BUILD_SHARED_LIBS} CACHE INTERNAL "")
         set(CARES_INSTALL   OFF CACHE INTERNAL "")
+        set(CARES_THREADS   ON CACHE BOOL "Build c-ares with required thread-safety support" FORCE)
+        if(NOT WIN32)
+            find_package(Threads REQUIRED)
+        endif()
         add_subdirectory(vendor/c-ares/c-ares)
-        target_compile_options(c-ares PRIVATE -w)
+        if(MSVC)
+            target_compile_options(c-ares PRIVATE /w)
+        else()
+            target_compile_options(c-ares PRIVATE -w)
+        endif()
     endif()
 endif()
 
@@ -158,21 +166,27 @@ if(LIBCORO_FEATURE_NETWORKING)
             include/coro/detail/io_notifier_epoll.hpp src/detail/io_notifier_epoll.cpp
             src/detail/async_operation_posix.cpp
         )
-    endif()
-    if(MACOSX OR CMAKE_SYSTEM_NAME MATCHES "FreeBSD|OpenBSD|NetBSD|DragonFly")
+    elseif(MACOSX OR CMAKE_SYSTEM_NAME MATCHES "FreeBSD|OpenBSD|NetBSD|DragonFly")
         list(APPEND LIBCORO_SOURCE_FILES
             include/coro/detail/io_notifier_kqueue.hpp src/detail/io_notifier_kqueue.cpp
             src/detail/async_operation_posix.cpp
         )
+    elseif(WIN32)
+        list(APPEND LIBCORO_SOURCE_FILES
+            include/coro/detail/io_notifier_iocp.hpp src/detail/io_notifier_iocp.cpp
+            src/detail/async_operation_win32.cpp
+        )
+    else()
+        message(FATAL_ERROR "LIBCORO_FEATURE_NETWORKING: no event notifier for ${CMAKE_SYSTEM_NAME}")
     endif()
 
-
     list(APPEND LIBCORO_SOURCE_FILES
-        include/coro/net/dns/resolver.hpp src/net/dns/resolver.cpp
+        include/coro/net/dns/resolver.hpp
         include/coro/net/connect.hpp src/net/connect.cpp
         include/coro/net/hostname.hpp
         include/coro/net/ip_address.hpp src/net/ip_address.cpp
         include/coro/net/socket_address.hpp
+        include/coro/net/io.hpp
         include/coro/net/io_status.hpp src/net/io_status.cpp
         include/coro/net/socket.hpp src/net/socket.cpp
         include/coro/net/detail/socket_api.hpp
@@ -253,6 +267,9 @@ endif()
 
 if(LIBCORO_FEATURE_NETWORKING)
     target_link_libraries(${PROJECT_NAME} PUBLIC c-ares::cares)
+    if(WIN32)
+        target_link_libraries(${PROJECT_NAME} PUBLIC ws2_32)
+    endif()
     target_compile_definitions(${PROJECT_NAME} PUBLIC LIBCORO_FEATURE_NETWORKING)
     if(LIBCORO_FEATURE_TLS)
         target_link_libraries(${PROJECT_NAME} PUBLIC OpenSSL::SSL OpenSSL::Crypto)

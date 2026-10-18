@@ -3,13 +3,25 @@
 #include "coro/net/detail/socket_api.hpp"
 #include "coro/net/socket_address.hpp"
 
+#include <atomic>
+#include <cstdint>
 #include <span>
 #include <utility>
 
 #include <iostream>
 
+namespace coro
+{
+class scheduler;
+} // namespace coro
+
 namespace coro::net
 {
+/**
+ * Owns a native socket handle; move-only.
+ * On Windows a socket is bound to the first scheduler that waits on it (IOCP association is permanent):
+ * waiting operations through any other scheduler fail with a native WSAEINVAL io_status.
+ */
 class socket
 {
 public:
@@ -49,9 +61,14 @@ public:
     socket() = default;
     explicit socket(native_handle_t handle) : m_handle(handle) {}
 
-    socket(const socket& other);
-    socket(socket&& other) noexcept : m_handle(std::exchange(other.m_handle, invalid_native_handle)) {}
-    auto operator=(const socket& other) noexcept -> socket&;
+    socket(const socket&) = delete;
+    socket(socket&& other) noexcept : m_handle(std::exchange(other.m_handle, invalid_native_handle))
+    {
+#if defined(CORO_PLATFORM_WINDOWS)
+        m_iocp_binding.store(other.m_iocp_binding.exchange(0, std::memory_order::relaxed), std::memory_order::relaxed);
+#endif
+    }
+    auto operator=(const socket&) -> socket& = delete;
     auto operator=(socket&& other) noexcept -> socket&;
 
     ~socket() { close(); }
@@ -87,7 +104,13 @@ public:
     auto native_handle() const -> native_handle_t { return m_handle; }
 
 private:
+    friend class ::coro::scheduler;
+
     native_handle_t m_handle{invalid_native_handle};
+#if defined(CORO_PLATFORM_WINDOWS)
+    /// Id of the scheduler event notifier this socket is associated with, 0 if none yet.
+    std::atomic<std::uint64_t> m_iocp_binding{0};
+#endif
 };
 
 /**

@@ -11,12 +11,12 @@
 #include <stop_token>
 #include <thread>
 
-#include <sys/socket.h>
+#if !defined(CORO_PLATFORM_WINDOWS)
+    #include <sys/socket.h>
+#endif
 
 TEST_CASE("scheduler", "[scheduler]")
-{
-    std::cerr << "[scheduler]\n\n";
-}
+{ std::cerr << "[scheduler]\n\n"; }
 
 using namespace std::chrono_literals;
 
@@ -24,9 +24,24 @@ namespace
 {
 auto make_socket_pair() -> std::array<coro::net::socket, 2>
 {
+#if defined(CORO_PLATFORM_WINDOWS)
+    const auto options = coro::net::socket::options{coro::net::socket::type_t::tcp, coro::net::socket::blocking_t::yes};
+    auto       listener    = coro::net::make_accept_socket(options, {"127.0.0.1", 0}, 1);
+    auto       endpoint    = coro::net::socket_address::make_uninitialised();
+    auto [address, length] = endpoint.native_mutable_data();
+    REQUIRE(::getsockname(listener.native_handle(), address, length) == 0);
+
+    auto connector                         = coro::net::make_socket(options, coro::net::domain_t::ipv4);
+    const auto [peer_address, peer_length] = endpoint.data();
+    REQUIRE(::connect(connector.native_handle(), peer_address, peer_length) == 0);
+    auto accepted = coro::net::socket{::accept(listener.native_handle(), nullptr, nullptr)};
+    REQUIRE(accepted.is_ok());
+    auto sockets = std::array{std::move(connector), std::move(accepted)};
+#else
     std::array<int, 2> handles{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, handles.data()) == 0);
     auto sockets = std::array{coro::net::socket{handles[0]}, coro::net::socket{handles[1]}};
+#endif
     REQUIRE(sockets[0].blocking(coro::net::socket::blocking_t::no));
     REQUIRE(sockets[1].blocking(coro::net::socket::blocking_t::no));
     return sockets;
@@ -113,8 +128,9 @@ TEST_CASE("scheduler task with multiple events", "[scheduler]")
         e.set();
     };
 
-    coro::sync_wait(coro::when_all(
-        make_wait_task(s, counter, e1, e2, e3), make_set_task(s, e1), make_set_task(s, e2), make_set_task(s, e3)));
+    coro::sync_wait(
+        coro::when_all(
+            make_wait_task(s, counter, e1, e2, e3), make_set_task(s, e1), make_set_task(s, e2), make_set_task(s, e3)));
 
     REQUIRE(counter == 3);
 
@@ -207,6 +223,38 @@ TEST_CASE("scheduler task with read timeout", "[scheduler]")
     s->shutdown();
     REQUIRE(s->empty());
 }
+
+#if defined(CORO_PLATFORM_WINDOWS)
+TEST_CASE("scheduler rejects a socket bound to another scheduler", "[scheduler]")
+{
+    auto sockets = make_socket_pair();
+    auto first =
+        coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
+    auto second =
+        coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
+
+    auto make_task = [&](std::unique_ptr<coro::scheduler>& s) -> coro::task<coro::net::io_status>
+    {
+        co_await s->schedule();
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 10ms);
+        co_return status;
+    };
+
+    // The pending read binds the socket to the first scheduler's completion port.
+    REQUIRE(coro::sync_wait(make_task(first)).is_timeout());
+    REQUIRE(coro::sync_wait(make_task(first)).is_timeout());
+
+    auto foreign = coro::sync_wait(make_task(second));
+    REQUIRE(foreign.type == coro::net::io_status::kind::native);
+    REQUIRE(foreign.native_code == WSAEINVAL);
+
+    first->shutdown();
+    second->shutdown();
+    REQUIRE(first->empty());
+    REQUIRE(second->empty());
+}
+#endif
 
 TEST_CASE("scheduler pending read cancellation", "[scheduler]")
 {
@@ -464,9 +512,11 @@ TEST_CASE("scheduler scheduler_after", "[scheduler]")
     };
 
     {
-        auto s     = coro::scheduler::make_unique(coro::scheduler::options{
+        auto s = coro::scheduler::make_unique(
+            coro::scheduler::options{
                 .pool = coro::thread_pool::options{
-                    .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
+                    .thread_count            = 1,
+                    .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
         auto start = std::chrono::steady_clock::now();
         coro::sync_wait(func(*s, 0ms, counter, tid));
         auto stop     = std::chrono::steady_clock::now();
@@ -481,9 +531,11 @@ TEST_CASE("scheduler scheduler_after", "[scheduler]")
     }
 
     {
-        auto s = coro::scheduler::make_unique(coro::scheduler::options{
-            .pool = coro::thread_pool::options{
-                .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
+        auto s = coro::scheduler::make_unique(
+            coro::scheduler::options{
+                .pool = coro::thread_pool::options{
+                    .thread_count            = 1,
+                    .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
 
         auto start = std::chrono::steady_clock::now();
         coro::sync_wait(func(*s, wait_for, counter, tid));
@@ -507,9 +559,10 @@ TEST_CASE("scheduler schedule_at", "[scheduler]")
     std::atomic<uint64_t>               counter{0};
     std::thread::id                     tid;
 
-    auto s = coro::scheduler::make_unique(coro::scheduler::options{
-        .pool = coro::thread_pool::options{
-            .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
+    auto s = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool = coro::thread_pool::options{
+                .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
 
     auto func = [](std::unique_ptr<coro::scheduler>&     s,
                    std::atomic<uint64_t>&                counter,
@@ -556,9 +609,10 @@ TEST_CASE("scheduler schedule_at", "[scheduler]")
 TEST_CASE("scheduler yield", "[scheduler]")
 {
     std::thread::id tid;
-    auto            s = coro::scheduler::make_unique(coro::scheduler::options{
-                   .pool = coro::thread_pool::options{
-                       .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
+    auto            s = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .pool = coro::thread_pool::options{
+                .thread_count = 1, .on_thread_start_functor = [&](std::size_t) { tid = std::this_thread::get_id(); }}});
 
     auto func = [](std::unique_ptr<coro::scheduler>& s, std::thread::id& tid) -> coro::task<void>
     {
@@ -764,9 +818,10 @@ TEST_CASE("scheduler manual process events thread pool", "[scheduler]")
 TEST_CASE("scheduler manual process events inline", "[scheduler]")
 {
     auto sockets = make_socket_pair();
-    auto s = coro::scheduler::make_unique(coro::scheduler::options{
-        .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
-        .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_inline});
+    auto s       = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
+            .execution_strategy = coro::scheduler::execution_strategy_t::process_tasks_inline});
 
     auto make_read_task = [&]() -> coro::task<void>
     {
@@ -909,6 +964,4 @@ TEST_CASE("scheduler schedule with <= 0ms timeout", "[scheduler]")
 }
 
 TEST_CASE("~scheduler", "[scheduler]")
-{
-    std::cerr << "[~scheduler]\n\n";
-}
+{ std::cerr << "[~scheduler]\n\n"; }

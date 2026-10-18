@@ -14,7 +14,7 @@ auto main() -> int
 
                 if (rstatus.is_ok())
                 {
-                    co_await client.write_all(rspan);
+                    co_await coro::net::write_all(client, rspan);
                 }
                 else if (rstatus.is_closed())
                 {

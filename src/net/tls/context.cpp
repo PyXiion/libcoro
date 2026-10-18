@@ -51,16 +51,19 @@ context::context(
     verify_peer_t         verify_peer)
     : context(verify_peer)
 {
-    if (auto r = SSL_CTX_use_certificate_file(m_ssl_ctx, certificate.c_str(), static_cast<int>(certificate_type));
+    const auto certificate_path = certificate.string();
+    const auto private_key_path = private_key.string();
+
+    if (auto r = SSL_CTX_use_certificate_file(m_ssl_ctx, certificate_path.c_str(), static_cast<int>(certificate_type));
         r != 1)
     {
-        throw std::runtime_error{"Failed to load certificate file " + certificate.string()};
+        throw std::runtime_error{"Failed to load certificate file " + certificate_path};
     }
 
-    if (auto r = SSL_CTX_use_PrivateKey_file(m_ssl_ctx, private_key.c_str(), static_cast<int>(private_key_type));
+    if (auto r = SSL_CTX_use_PrivateKey_file(m_ssl_ctx, private_key_path.c_str(), static_cast<int>(private_key_type));
         r != 1)
     {
-        throw std::runtime_error{"Failed to load private key file " + private_key.string()};
+        throw std::runtime_error{"Failed to load private key file " + private_key_path};
     }
 
     if (auto r = SSL_CTX_check_private_key(m_ssl_ctx); r != 1)

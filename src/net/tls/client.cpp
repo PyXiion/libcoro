@@ -77,9 +77,7 @@ client::client(
       m_socket(std::move(socket)),
       m_connect_status(connection_status::connected),
       m_tls_info{tls_connection_type::accept}
-{
-    m_socket.blocking(net::socket::blocking_t::no);
-}
+{ m_socket.blocking(net::socket::blocking_t::no); }
 
 client::client(client&& other) noexcept
     : m_scheduler(std::exchange(other.m_scheduler, nullptr)),
@@ -116,9 +114,7 @@ auto client::operator=(client&& other) noexcept -> client&
 }
 
 auto client::make_deadline(std::chrono::milliseconds timeout) -> deadline
-{
-    return timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : deadline::max();
-}
+{ return timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : deadline::max(); }
 
 auto client::connect(std::chrono::milliseconds timeout, std::stop_token stop_token) -> coro::task<connection_status>
 {
@@ -225,9 +221,9 @@ auto client::drive(ssl_call_type ssl_call, deadline deadline, std::stop_token st
         const auto result = ssl_call();
         // Capture the thread-local OpenSSL error before BIO calls or coroutine suspension.
         const auto error = result > 0 || (shutting_down && result == 0) ? SSL_ERROR_NONE : SSL_get_error(tls, result);
-        const auto empty_error_queue = ERR_peek_error() == 0;
-        if (error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE &&
-            error != SSL_ERROR_ZERO_RETURN && !(error == SSL_ERROR_SYSCALL && empty_error_queue))
+        const auto fatal_error = error != SSL_ERROR_NONE && error != SSL_ERROR_WANT_READ &&
+                                 error != SSL_ERROR_WANT_WRITE && error != SSL_ERROR_ZERO_RETURN;
+        if (fatal_error)
         {
             m_tls_info.m_tls_error = true;
         }
@@ -235,7 +231,7 @@ auto client::drive(ssl_call_type ssl_call, deadline deadline, std::stop_token st
         status = co_await flush_ciphertext(deadline, stop_token);
         if (!status.is_ok())
         {
-            co_return {result, status};
+            co_return {result, fatal_error ? io_status{io_status::kind::tls_error, error} : status};
         }
         if (result > 0)
         {
@@ -265,13 +261,15 @@ auto client::drive(ssl_call_type ssl_call, deadline deadline, std::stop_token st
                     std::span<std::byte>{m_tls_info.m_ciphertext_buffer.get(), ciphertext_buffer_size},
                     timeout,
                     stop_token);
+                if (read_status.is_closed() || (read_status.is_ok() && bytes_read == 0))
+                {
+                    // Let OpenSSL distinguish an unauthenticated EOF from TLS close_notify.
+                    BIO_set_mem_eof_return(SSL_get_rbio(tls), 0);
+                    break;
+                }
                 if (!read_status.is_ok())
                 {
                     co_return {result, read_status};
-                }
-                if (bytes_read == 0)
-                {
-                    co_return {result, io_status{io_status::kind::closed}};
                 }
 
                 std::size_t offset{0};
@@ -294,14 +292,7 @@ auto client::drive(ssl_call_type ssl_call, deadline deadline, std::stop_token st
                 break;
             case SSL_ERROR_ZERO_RETURN:
                 co_return {result, io_status{io_status::kind::closed}};
-            case SSL_ERROR_SYSCALL:
-                if (empty_error_queue)
-                {
-                    co_return {result, io_status{io_status::kind::closed}};
-                }
-                [[fallthrough]];
             default:
-                m_tls_info.m_tls_error = true;
                 co_return {result, io_status{io_status::kind::tls_error, error}};
         }
     }
@@ -370,41 +361,6 @@ auto client::write_some_impl(std::span<const std::byte> buffer, deadline deadlin
         deadline,
         stop_token);
     co_return {status, bytes_written};
-}
-
-auto client::read_exact_impl(std::span<std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
-    -> coro::task<std::pair<io_status, std::span<std::byte>>>
-{
-    const auto deadline  = make_deadline(timeout);
-    auto       remaining = buffer;
-    while (!remaining.empty())
-    {
-        auto [status, bytes_read] = co_await read_some_impl(remaining, deadline, stop_token);
-        remaining                 = remaining.subspan(bytes_read);
-        if (!status.is_ok())
-        {
-            co_return {status, buffer.first(buffer.size() - remaining.size())};
-        }
-    }
-    co_return {io_status{io_status::kind::ok}, buffer};
-}
-
-auto client::write_all_impl(
-    std::span<const std::byte> buffer, std::chrono::milliseconds timeout, std::stop_token stop_token)
-    -> coro::task<std::pair<io_status, std::span<const std::byte>>>
-{
-    const auto deadline  = make_deadline(timeout);
-    auto       remaining = buffer;
-    while (!remaining.empty())
-    {
-        auto [status, bytes_written] = co_await write_some_impl(remaining, deadline, stop_token);
-        remaining                    = remaining.subspan(bytes_written);
-        if (!status.is_ok())
-        {
-            co_return {status, remaining};
-        }
-    }
-    co_return {io_status{io_status::kind::ok}, {}};
 }
 
 auto client::tls_shutdown_and_free(std::chrono::milliseconds timeout) -> coro::task<void>
