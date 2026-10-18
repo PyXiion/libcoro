@@ -30,9 +30,8 @@ namespace coro
  * (`schedule()` from other threads, `yield()`, `resume()`, `spawn_detached()` and `spawn_joinable()`) goes through a
  * shared FIFO queue, so wake-up order requested by the caller is kept.
  *
- * When shutting down, either by the thread pool destructing or by manually calling shutdown()
- * the thread pool will stop accepting new tasks but will complete all tasks that were scheduled
- * prior to the shutdown request.
+ * Shutdown rejects new coroutine publications, drains all accepted resumptions, and joins the workers.
+ * Coroutines suspended on external events must be joined before shutting down the pool.
  */
 class thread_pool
 {
@@ -64,8 +63,9 @@ public:
         /**
          * Suspending always returns to the caller (using void return of await_suspend()) and
          * stores the coroutine internally for the executing thread to resume from.
+         * @throw std::runtime_error If shutdown began before the coroutine could be queued.
          */
-        auto await_suspend(std::coroutine_handle<> awaiting_coroutine) noexcept -> void;
+        auto await_suspend(std::coroutine_handle<> awaiting_coroutine) -> void;
 
         /**
          * no-op as this is the function called first by the thread pool's executing thread.
@@ -126,7 +126,7 @@ public:
      * called from within the coroutines function body to schedule the coroutine on the thread pool.
      * When awaited on one of this pool's executor threads the coroutine runs before older queued work (depth first),
      * so this is a fork point rather than a way to let other tasks run, use `yield()` for that.
-     * @throw std::runtime_error If the thread pool is `shutdown()` scheduling new tasks is not permitted.
+     * @throw std::runtime_error If shutdown has begun, either when creating or awaiting the operation.
      * @return The schedule operation to switch from the calling scheduling thread to the executor thread
      *         pool thread.
      */
@@ -190,36 +190,23 @@ public:
     template<coro::concepts::sized_range_of<std::coroutine_handle<>> range_type>
     auto resume(const range_type& handles) noexcept -> std::size_t
     {
-        m_size.fetch_add(std::size(handles), std::memory_order::release);
-        // Count the tasks before publishing them so consumers never decrement the counter below zero.
-        m_queue_size.fetch_add(std::size(handles), std::memory_order::seq_cst);
-
-        std::size_t null_handles{0};
-
+        std::size_t total{0};
         {
             std::scoped_lock lk{m_global_mutex};
+            if (m_shutdown_requested.load(std::memory_order::acquire))
+            {
+                return 0;
+            }
             for (const auto& handle : handles)
             {
                 if (handle != nullptr) [[likely]]
                 {
                     m_global_queue.emplace_back(handle);
-                }
-                else
-                {
-                    ++null_handles;
+                    ++total;
                 }
             }
         }
-
-        if (null_handles > 0)
-        {
-            m_queue_size.fetch_sub(null_handles, std::memory_order::release);
-            m_size.fetch_sub(null_handles, std::memory_order::release);
-        }
-
-        std::size_t total = std::size(handles) - null_handles;
         wake(total);
-
         return total;
     }
 
@@ -233,40 +220,29 @@ public:
     [[nodiscard]] auto yield() -> schedule_operation;
 
     /**
-     * Shuts down the thread pool.  This will finish any tasks scheduled prior to calling this
-     * function but will prevent the thread pool from scheduling any new tasks.  This call is
-     * blocking and will wait until all inflight tasks are completed before returning.
+     * Rejects new coroutine publications, drains already accepted resumptions, and joins all workers.
+     * Coroutines suspended on external events must be joined separately before calling this function.
      */
     auto shutdown() noexcept -> void;
 
     [[nodiscard]] auto is_shutdown() const -> bool { return m_shutdown_requested.load(std::memory_order::acquire); }
 
     /**
-     * @return The number of tasks waiting in the task queue + the executing tasks.
+     * @return True if all workers are idle or stopped and no tasks are queued. This does not join suspended tasks.
      */
-    auto size() const noexcept -> std::size_t { return m_size.load(std::memory_order::acquire); }
+    auto empty() const noexcept -> bool;
 
     /**
-     * @return True if the task queue is empty and zero tasks are currently executing.
+     * @return True if no tasks are waiting in the queues.
      */
-    auto empty() const noexcept -> bool { return size() == 0; }
-
-    /**
-     * @return The number of tasks waiting in the task queues to be executed.
-     */
-    auto queue_size() const noexcept -> std::size_t { return m_queue_size.load(std::memory_order::acquire); }
-
-    /**
-     * @return True if the task queues are currently empty.
-     */
-    auto queue_empty() const noexcept -> bool { return queue_size() == 0; }
+    auto queue_empty() const noexcept -> bool;
 
 private:
     /// Queue owned by one executor thread.  The owner pushes and pops at the back (LIFO), other executors steal
     /// from the front (FIFO) so they take the oldest and usually largest piece of work.
-    struct worker_queue
+    struct alignas(64) worker_queue
     {
-        std::mutex                          m_mutex;
+        mutable std::mutex                  m_mutex;
         std::deque<std::coroutine_handle<>> m_queue;
     };
 
@@ -277,11 +253,11 @@ private:
     /// One queue per executor thread, indexed by the executor's idx.
     std::unique_ptr<worker_queue[]> m_worker_queues;
     /// Guards m_global_queue.
-    std::mutex m_global_mutex;
+    alignas(64) mutable std::mutex m_global_mutex;
     /// FIFO queue of tasks scheduled from outside the executors, yielded, or resumed.
     std::deque<std::coroutine_handle<>> m_global_queue;
     /// Mutex for executor threads to sleep on the condition variable.
-    std::mutex m_wait_mutex;
+    alignas(64) mutable std::mutex m_wait_mutex;
     /// Condition variable for each executor thread to wait on when no tasks are available.
     std::condition_variable_any m_wait_cv;
 
@@ -295,7 +271,7 @@ private:
      * @param handle The coroutine to queue.
      * @param global Use the shared FIFO queue even when called from one of this pool's executor threads.
      */
-    auto enqueue(std::coroutine_handle<> handle, bool global) noexcept -> void;
+    auto enqueue(std::coroutine_handle<> handle, bool global) noexcept -> bool;
     /// Pops the newest task from the executor's own queue.
     auto pop_local(std::size_t idx) noexcept -> std::coroutine_handle<>;
     /// Pops the oldest task from the shared queue.
@@ -305,14 +281,10 @@ private:
     /// Wakes up to `count` sleeping executor threads.
     auto wake(std::size_t count) noexcept -> void;
 
-    /// The number of tasks in the queue + currently executing.
-    std::atomic<std::size_t> m_size{0};
-    /// The number of tasks waiting in all queues.
-    std::atomic<std::size_t> m_queue_size{0};
-    /// The number of executor threads waiting on m_wait_cv.
-    std::atomic<std::size_t> m_sleeping{0};
+    /// Registered idle executors, including executors that have exited during shutdown.
+    alignas(64) std::atomic<std::size_t> m_sleeping{0};
     /// Has the thread pool been requested to shut down?
-    std::atomic<bool> m_shutdown_requested{false};
+    alignas(64) std::atomic<bool> m_shutdown_requested{false};
 };
 
 } // namespace coro
