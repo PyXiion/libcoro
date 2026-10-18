@@ -3,15 +3,20 @@
 #include <coro/coro.hpp>
 #include <coro/net/socket.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <iostream>
+#include <span>
 #include <stop_token>
 #include <thread>
 
-#if !defined(CORO_PLATFORM_WINDOWS)
+#if defined(CORO_PLATFORM_WINDOWS)
+    #include <windows.h>
+#else
     #include <sys/socket.h>
 #endif
 
@@ -254,6 +259,32 @@ TEST_CASE("scheduler rejects a socket bound to another scheduler", "[scheduler]"
     REQUIRE(first->empty());
     REQUIRE(second->empty());
 }
+
+TEST_CASE("scheduler rejects a socket with skip-on-success completion notifications", "[scheduler]")
+{
+    auto sockets = make_socket_pair();
+    REQUIRE(
+        ::SetFileCompletionNotificationModes(
+            reinterpret_cast<HANDLE>(sockets[0].native_handle()), FILE_SKIP_COMPLETION_PORT_ON_SUCCESS));
+    auto s =
+        coro::scheduler::make_unique(coro::scheduler::options{.pool = coro::thread_pool::options{.thread_count = 1}});
+
+    auto make_task = [&](coro::net::socket& socket) -> coro::task<coro::net::io_status>
+    {
+        co_await s->schedule();
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(socket, buffer, 10ms);
+        co_return status;
+    };
+
+    auto status = coro::sync_wait(make_task(sockets[0]));
+    REQUIRE(status.type == coro::net::io_status::kind::native);
+    REQUIRE(status.native_code == WSAEINVAL);
+    REQUIRE(coro::sync_wait(make_task(sockets[1])).is_timeout());
+
+    s->shutdown();
+    REQUIRE(s->empty());
+}
 #endif
 
 TEST_CASE("scheduler pending read cancellation", "[scheduler]")
@@ -329,6 +360,123 @@ TEST_CASE("scheduler pre-cancelled read preserves later data", "[scheduler]")
     coro::sync_wait(make_task());
     s->shutdown();
     REQUIRE(s->empty());
+}
+
+TEST_CASE("scheduler supports one pending read and one pending write on the same socket", "[scheduler]")
+{
+    auto sockets  = make_socket_pair();
+    auto strategy = GENERATE(
+        coro::scheduler::execution_strategy_t::process_tasks_inline,
+        coro::scheduler::execution_strategy_t::process_tasks_on_thread_pool);
+    auto s = coro::scheduler::make_unique(
+        coro::scheduler::options{
+            .thread_strategy    = coro::scheduler::thread_strategy_t::manual,
+            .pool               = coro::thread_pool::options{.thread_count = 1},
+            .execution_strategy = strategy});
+
+    std::array<std::byte, 16384> fill{};
+    std::size_t                  queued{0};
+    for (;;)
+    {
+#if defined(CORO_PLATFORM_WINDOWS)
+        auto bytes = ::send(
+            sockets[0].native_handle(), reinterpret_cast<const char*>(fill.data()), static_cast<int>(fill.size()), 0);
+#else
+        auto bytes = ::send(sockets[0].native_handle(), fill.data(), fill.size(), 0);
+#endif
+        if (bytes > 0)
+        {
+            queued += static_cast<std::size_t>(bytes);
+            continue;
+        }
+        REQUIRE(bytes == -1);
+#if defined(CORO_PLATFORM_WINDOWS)
+        REQUIRE(::WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
+#endif
+        break;
+    }
+    REQUIRE(queued > 0);
+
+    std::stop_source  stop_source;
+    std::atomic<bool> write_completed{false};
+    auto              make_read_task = [&]() -> coro::task<void>
+    {
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s, stop_source.get_token());
+        REQUIRE(status.type == coro::net::io_status::kind::cancelled);
+        REQUIRE(bytes == 0);
+        REQUIRE(write_completed.load());
+    };
+    auto make_write_task = [&]() -> coro::task<void>
+    {
+        auto [status, bytes] = co_await s->write_some(sockets[0], fill, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes > 0);
+        write_completed.store(true);
+        REQUIRE(stop_source.request_stop());
+    };
+    auto make_drain_task = [&]() -> coro::task<void>
+    {
+        std::array<std::byte, 16384> buffer{};
+        auto                         remaining = queued;
+        while (remaining > 0)
+        {
+            auto [status, bytes] =
+                co_await s->read_some(sockets[1], std::span{buffer}.first(std::min(remaining, buffer.size())), 5s);
+            REQUIRE(status.is_ok());
+            REQUIRE(bytes > 0);
+            remaining -= bytes;
+        }
+    };
+
+    auto read_task  = make_read_task();
+    auto write_task = make_write_task();
+    read_task.resume();
+    write_task.resume();
+    REQUIRE_FALSE(read_task.is_ready());
+    REQUIRE_FALSE(write_task.is_ready());
+    REQUIRE(s->size() == 2);
+
+    auto drain_task = make_drain_task();
+    drain_task.resume();
+    while (s->process_events(100ms) > 0) {}
+    coro::sync_wait(read_task);
+    coro::sync_wait(write_task);
+    coro::sync_wait(drain_task);
+
+    auto make_later_read_task = [&]() -> coro::task<void>
+    {
+        std::array<std::byte, 1> buffer{};
+        auto [status, bytes] = co_await s->read_some(sockets[0], buffer, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+        REQUIRE(buffer[0] == std::byte{42});
+    };
+    auto make_peer_write_task = [&]() -> coro::task<void>
+    {
+        const auto value     = std::array{std::byte{42}};
+        auto [status, bytes] = co_await s->write_some(sockets[1], value, 5s);
+        REQUIRE(status.is_ok());
+        REQUIRE(bytes == 1);
+    };
+    auto later_read_task = make_later_read_task();
+    later_read_task.resume();
+    REQUIRE_FALSE(later_read_task.is_ready());
+    auto peer_write_task = make_peer_write_task();
+    peer_write_task.resume();
+    while (s->process_events(100ms) > 0) {}
+    s->shutdown();
+    REQUIRE(s->empty());
+    REQUIRE(later_read_task.is_ready());
+    REQUIRE(peer_write_task.is_ready());
+    coro::sync_wait(later_read_task);
+    coro::sync_wait(peer_write_task);
 }
 
 TEST_CASE("scheduler separate thread resume", "[scheduler]")

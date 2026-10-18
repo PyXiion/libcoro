@@ -444,35 +444,28 @@ public:
             return ::coro::io_notifier::try_now(m_op);
         }
 
-        auto await_suspend(std::coroutine_handle<> handle) -> bool
+        auto await_suspend(std::coroutine_handle<> handle) -> void
         {
             m_op.m_awaiting_coroutine = handle;
             m_scheduler.m_size.fetch_add(1, std::memory_order::release);
+            // The event loop completes operations only under this mutex, so a completion racing this publication is
+            // resumed by the scheduler like any other and never continues on the submitting thread.
+            std::scoped_lock lock{m_scheduler.m_publication_mutex};
+            if (m_timeout > std::chrono::nanoseconds{0})
             {
-                std::scoped_lock lock{m_scheduler.m_publication_mutex};
-                if (m_timeout > std::chrono::nanoseconds{0})
+                m_scheduler.add_timer_token(clock::now() + m_timeout, m_op);
+            }
+            if constexpr (kind != detail::async_op_kind::timer)
+            {
+                if (!m_scheduler.m_io_notifier.submit(m_op))
                 {
-                    m_scheduler.add_timer_token(clock::now() + m_timeout, m_op);
-                }
-                if constexpr (kind != detail::async_op_kind::timer)
-                {
-                    if (!m_scheduler.m_io_notifier.submit(m_op))
-                    {
-                        m_scheduler.request_cancel(m_op);
-                    }
-                }
-                if (m_stop.stop_possible())
-                {
-                    m_callback.emplace(m_stop, cancel_callback{m_scheduler, m_op});
+                    m_scheduler.request_cancel(m_op);
                 }
             }
-            auto previous = m_op.m_state.fetch_or(detail::async_operation::state_suspended, std::memory_order::acq_rel);
-            if (previous & detail::async_operation::state_finished)
+            if (m_stop.stop_possible())
             {
-                m_scheduler.m_size.fetch_sub(1, std::memory_order::release);
-                return false;
+                m_callback.emplace(m_stop, cancel_callback{m_scheduler, m_op});
             }
-            return true;
         }
 
         auto await_resume() -> auto

@@ -4,10 +4,38 @@
 
     #include <coro/coro.hpp>
 
+    #include <coroutine>
     #include <future>
     #include <memory>
+    #include <thread>
     #include <utility>
     #include <vector>
+
+namespace
+{
+/// A conforming executor whose resume() runs the handle inline; schedule() still moves onto its pool.
+class inline_resume_executor
+{
+public:
+    explicit inline_resume_executor(std::unique_ptr<coro::thread_pool> pool) : m_pool(std::move(pool)) {}
+
+    auto schedule() { return m_pool->schedule(); }
+    auto spawn_detached(coro::task<void>&& task) -> bool { return m_pool->spawn_detached(std::move(task)); }
+    auto spawn_joinable(coro::task<void>&& task) -> coro::task<void> { return m_pool->spawn_joinable(std::move(task)); }
+    auto yield() { return m_pool->yield(); }
+    auto resume(std::coroutine_handle<> handle) -> bool
+    {
+        handle.resume();
+        return true;
+    }
+    auto size() -> std::size_t { return m_pool->size(); }
+    auto empty() -> bool { return m_pool->empty(); }
+    auto shutdown() -> void { m_pool->shutdown(); }
+
+private:
+    std::unique_ptr<coro::thread_pool> m_pool;
+};
+} // namespace
 
 TEST_CASE("dns lookup owns its hostname and returns addresses that outlive the resolver", "[dns]")
 {
@@ -115,6 +143,32 @@ TEST_CASE("dns resolver constructor failure does not prevent subsequent use", "[
     auto result = coro::sync_wait(executor->schedule(resolver.host_by_name(coro::net::hostname{"127.0.0.1"})));
     executor->shutdown();
     REQUIRE(result.is_ok());
+}
+
+TEST_CASE("dns lookup completed on the c-ares thread may destroy its resolver", "[dns]")
+{
+    std::thread::id pool_thread;
+    auto            executor = std::make_unique<inline_resume_executor>(coro::thread_pool::make_unique(
+        coro::thread_pool::options{
+            .thread_count            = 1,
+            .on_thread_start_functor = [&](std::size_t) { pool_thread = std::this_thread::get_id(); }}));
+    auto            resolver = std::make_unique<coro::net::dns::resolver<inline_resume_executor>>(executor);
+
+    auto lookup = [&]() -> coro::task<std::thread::id>
+    {
+        co_await executor->schedule();
+        // c-ares cannot answer this name locally, so whether the query succeeds, fails or times out its callback runs
+        // on the c-ares event thread, where the executor would resume this coroutine inline.
+        co_await resolver->host_by_name(coro::net::hostname{"libcoro-regression.invalid"});
+        // Destroying the channel from inside its own callback double-frees the query (Linux) or self-joins (Windows).
+        resolver.reset();
+        co_return std::this_thread::get_id();
+    };
+
+    auto continuation_thread = coro::sync_wait(lookup());
+    executor->shutdown();
+    REQUIRE(resolver == nullptr);
+    REQUIRE(continuation_thread == pool_thread);
 }
 
 #endif // LIBCORO_FEATURE_NETWORKING

@@ -12,6 +12,7 @@
 
 #include <mswsock.h>
 #include <windows.h>
+#include <winternl.h>
 
 namespace coro::detail
 {
@@ -82,7 +83,27 @@ auto io_notifier_iocp::associate(async_operation& op) -> int
     {
         return owner == m_id ? 0 : WSAEINVAL;
     }
-    if (::CreateIoCompletionPort(reinterpret_cast<HANDLE>(op.m_fd), m_port, io_key, 0) == nullptr)
+    // Some Windows SDKs omit FileIoCompletionNotificationInformation (41) and its structure.
+    struct file_io_completion_notification_information
+    {
+        ULONG Flags;
+    };
+    // Cast through void(*)() so compilers accept the FARPROC conversion without -Wcast-function-type.
+    static const auto query_information = reinterpret_cast<decltype(&::NtQueryInformationFile)>(
+        reinterpret_cast<void (*)()>(::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    auto                                        handle = reinterpret_cast<HANDLE>(op.m_fd);
+    IO_STATUS_BLOCK                             iosb{};
+    file_io_completion_notification_information info{};
+    // If the query is unavailable or fails, assume the mode is unset.
+    if (query_information != nullptr &&
+        query_information(handle, &iosb, &info, sizeof(info), static_cast<FILE_INFORMATION_CLASS>(41)) >= 0 &&
+        (info.Flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0)
+    {
+        // Synchronous success must post a packet so the scheduler can retire the OVERLAPPED.
+        op.m_iocp_binding->store(0, std::memory_order::release);
+        return WSAEINVAL;
+    }
+    if (::CreateIoCompletionPort(handle, m_port, io_key, 0) == nullptr)
     {
         auto error = ::GetLastError();
         op.m_iocp_binding->store(0, std::memory_order::release);
@@ -271,7 +292,8 @@ auto io_notifier_iocp::submit(async_operation& op) -> bool
             return false;
         }
     }
-    // Synchronous success also queues a packet; the OS still owns the OVERLAPPED until it is dequeued.
+    // Association rejects skip-on-success mode, so synchronous success also queues a packet;
+    // the OS owns the OVERLAPPED until it is dequeued.
     op.m_registered = true;
     return true;
 }

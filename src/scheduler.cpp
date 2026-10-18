@@ -219,11 +219,9 @@ auto scheduler::process_events_execute(std::chrono::milliseconds timeout) -> voi
     // Finish only after dispatch, so duplicate entries in this batch cannot outlive their operation.
     for (auto* op : m_ops_to_finish)
     {
-        auto previous = op->m_state.fetch_or(detail::async_operation::state_finished, std::memory_order::acq_rel);
-        if (previous & detail::async_operation::state_suspended)
-        {
-            m_handles_to_resume.emplace_back(op->m_awaiting_coroutine);
-        }
+        // Every published operation is suspended: await_suspend publishes it under the publication mutex.
+        m_handles_to_resume.emplace_back(op->m_awaiting_coroutine);
+        op->m_state.fetch_or(detail::async_operation::state_finished, std::memory_order::acq_rel);
     }
     m_ops_to_finish.clear();
 

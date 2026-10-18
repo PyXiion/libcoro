@@ -217,7 +217,7 @@ struct receive_wrapper
         return ready;
     }
 
-    auto await_suspend(std::coroutine_handle<> handle) -> bool { return m_op.await_suspend(handle); }
+    auto await_suspend(std::coroutine_handle<> handle) -> void { m_op.await_suspend(handle); }
 
     auto await_resume() -> auto { return m_op.await_resume(); }
 };

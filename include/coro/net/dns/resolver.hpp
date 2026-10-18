@@ -150,11 +150,15 @@ public:
      * The hostname is owned by the task, including before it is first awaited.
      * Keep each started task frame alive until completion. The resolver, executor, and
      * unique_ptr owning the executor must outlive every started lookup; do not reset that owner
-     * or shut down the executor while a lookup is pending.
+     * or shut down the executor while a lookup is pending. A lookup completed by the c-ares event
+     * thread continues through executor_type::schedule(), never inside the c-ares callback, so the
+     * resolver may be destroyed as soon as the lookup returns. schedule() must therefore resume on
+     * the executor's own threads, as coro::thread_pool and coro::scheduler do; an executor whose
+     * schedule() completes inline on the calling thread is not supported.
      */
     auto host_by_name(net::hostname hn) -> coro::task<dns::result>
     {
-        request_state request{m_executor};
+        request_state request{};
 
         ares_addrinfo_hints hints{};
         hints.ai_family = AF_UNSPEC; // Request both IPv4 and IPv6
@@ -167,7 +171,13 @@ public:
             ares_dns_callback,
             &request);
 
-        co_await request.m_resume;
+        // A lookup finished inside ares_getaddrinfo() is already set. Otherwise the callback resumes this coroutine
+        // inline on the c-ares event thread; leave it before the caller can destroy the channel from that thread.
+        if (!request.m_resume.is_set())
+        {
+            co_await request.m_resume;
+            co_await m_executor->schedule();
+        }
         if (request.m_exception != nullptr)
         {
             std::rethrow_exception(request.m_exception);
@@ -178,10 +188,9 @@ public:
 private:
     struct request_state
     {
-        std::unique_ptr<executor_type>& m_executor;
-        coro::event                     m_resume{};
-        dns::result                     m_result{};
-        std::exception_ptr              m_exception{};
+        coro::event        m_resume{};
+        dns::result        m_result{};
+        std::exception_ptr m_exception{};
     };
 
     /// Executor used to resume lookups completed by the c-ares event thread.
@@ -234,7 +243,7 @@ private:
         }
 
         // Resumption may destroy request; do not access it after signaling.
-        request.m_resume.set(request.m_executor, resume_order_policy::lifo);
+        request.m_resume.set(resume_order_policy::lifo);
     }
 };
 

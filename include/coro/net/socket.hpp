@@ -59,6 +59,12 @@ public:
     static auto type_to_os(type_t type) -> int;
 
     socket() = default;
+    /**
+     * Adopts a native socket handle.
+     * On Windows the handle must not have FILE_SKIP_COMPLETION_PORT_ON_SUCCESS enabled: such handles are refused
+     * with a native WSAEINVAL io_status on first scheduler use. Enabling this mode after first scheduler use is
+     * unsupported.
+     */
     explicit socket(native_handle_t handle) : m_handle(handle) {}
 
     socket(const socket&) = delete;

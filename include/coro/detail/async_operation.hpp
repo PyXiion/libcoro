@@ -40,7 +40,6 @@ struct async_operation
 {
     using timed_events = std::multimap<coro::time_point, async_operation*>;
 
-    static constexpr std::uint8_t state_suspended     = 1;
     static constexpr std::uint8_t state_finished      = 2;
     static constexpr std::uint8_t state_cancel_queued = 4;
     static constexpr std::uint8_t state_completed     = 8;

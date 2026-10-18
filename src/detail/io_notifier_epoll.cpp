@@ -110,10 +110,25 @@ auto io_notifier_epoll::watch_timer(const timer_handle& timer, std::chrono::nano
 
 auto io_notifier_epoll::watch(fd_t fd, poll_op op, void* data, bool keep) -> bool
 {
-    auto event_data     = event_t{};
-    event_data.events   = poll_op_to_events(op) | EPOLLRDHUP | (keep ? EPOLLET : EPOLLONESHOT);
-    event_data.data.ptr = data;
-    return ::epoll_ctl(m_fd, EPOLL_CTL_ADD, fd, &event_data) != -1;
+    if (fd < 0)
+    {
+        errno = EBADF;
+        return false;
+    }
+    std::scoped_lock lock{m_mutex};
+    if (static_cast<std::size_t>(fd) >= m_registrations.size())
+    {
+        m_registrations.resize(static_cast<std::size_t>(fd) + 1);
+    }
+    auto event_data    = event_t{};
+    event_data.events  = poll_op_to_events(op) | (keep ? EPOLLET : EPOLLONESHOT);
+    event_data.data.fd = fd;
+    if (::epoll_ctl(m_fd, EPOLL_CTL_ADD, fd, &event_data) == -1)
+    {
+        return false;
+    }
+    m_registrations[fd].tag = data;
+    return true;
 }
 
 auto io_notifier_epoll::try_now(async_operation& op) -> bool
@@ -121,27 +136,58 @@ auto io_notifier_epoll::try_now(async_operation& op) -> bool
 
 auto io_notifier_epoll::submit(async_operation& op) -> bool
 {
-    if (!watch(op.m_fd, operation_poll_op(op), &op))
+    if (op.m_fd < 0)
+    {
+        op.m_submit_error = EBADF;
+        return false;
+    }
+    std::scoped_lock lock{m_mutex};
+    if (static_cast<std::size_t>(op.m_fd) >= m_registrations.size())
+    {
+        m_registrations.resize(static_cast<std::size_t>(op.m_fd) + 1);
+    }
+    auto& current = m_registrations[op.m_fd];
+    auto  next    = current;
+    auto& slot    = operation_poll_op(op) == poll_op::read ? next.reader : next.writer;
+    if (slot != nullptr || next.tag != nullptr)
+    {
+        op.m_submit_error = EEXIST;
+        return false;
+    }
+    if (next.error != 0)
+    {
+        op.m_submit_error = next.error;
+        return false;
+    }
+    slot               = &op;
+    auto event_data    = event_t{};
+    event_data.events  = (next.reader != nullptr ? EPOLLIN | EPOLLRDHUP : 0) | (next.writer != nullptr ? EPOLLOUT : 0);
+    event_data.data.fd = op.m_fd;
+    auto action        = current.reader == nullptr && current.writer == nullptr ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+    if (::epoll_ctl(m_fd, action, op.m_fd, &event_data) == -1)
     {
         op.m_submit_error = errno;
         return false;
     }
+    current         = next;
     op.m_registered = true;
     return true;
 }
 
 auto io_notifier_epoll::complete_ready(async_operation& op, poll_status) -> bool
 {
-    if (!perform_posix(op))
+    int error;
     {
-        auto event_data     = event_t{};
-        event_data.events   = poll_op_to_events(operation_poll_op(op)) | EPOLLONESHOT | EPOLLRDHUP;
-        event_data.data.ptr = &op;
-        if (::epoll_ctl(m_fd, EPOLL_CTL_MOD, op.m_fd, &event_data) != -1)
-        {
-            return false;
-        }
-        op.m_status = net::make_io_status_from_native(errno);
+        std::scoped_lock lock{m_mutex};
+        error = m_registrations[op.m_fd].error;
+    }
+    if (error != 0)
+    {
+        op.m_status = net::make_io_status_from_native(error);
+    }
+    else if (!perform_posix(op))
+    {
+        return false;
     }
     cancel(op);
     return true;
@@ -149,16 +195,38 @@ auto io_notifier_epoll::complete_ready(async_operation& op, poll_status) -> bool
 
 auto io_notifier_epoll::cancel(async_operation& op) -> bool
 {
+    std::scoped_lock lock{m_mutex};
     if (op.m_registered)
     {
-        unwatch(op.m_fd, operation_poll_op(op));
-        op.m_registered = false;
+        auto& registration = m_registrations[op.m_fd];
+        auto& slot         = operation_poll_op(op) == poll_op::read ? registration.reader : registration.writer;
+        slot               = nullptr;
+        op.m_registered    = false;
+        if (registration.reader == nullptr && registration.writer == nullptr)
+        {
+            if (::epoll_ctl(m_fd, EPOLL_CTL_DEL, op.m_fd, nullptr) == -1 && errno != ENOENT && errno != EBADF)
+            {
+                std::cerr << "::epoll_ctl(DEL) error[" << errno << "] " << ::strerror(errno) << std::endl;
+            }
+            registration.error = 0;
+        }
+        else
+        {
+            auto event_data    = event_t{};
+            event_data.events  = (registration.reader != nullptr ? EPOLLIN | EPOLLRDHUP : 0) |
+                                 (registration.writer != nullptr ? EPOLLOUT : 0);
+            event_data.data.fd = op.m_fd;
+            if (::epoll_ctl(m_fd, EPOLL_CTL_MOD, op.m_fd, &event_data) == -1)
+            {
+                // The surviving operation must complete even if its readiness watch was lost.
+                registration.error = errno;
+                m_failed_fds.emplace_back(op.m_fd);
+                wake();
+            }
+        }
     }
     return true;
 }
-
-auto io_notifier_epoll::unwatch(fd_t fd, poll_op) -> bool
-{ return ::epoll_ctl(m_fd, EPOLL_CTL_DEL, fd, nullptr) != -1; }
 
 auto io_notifier_epoll::unwatch_timer(const timer_handle& timer) -> bool
 {
@@ -172,39 +240,72 @@ auto io_notifier_epoll::unwatch_timer(const timer_handle& timer) -> bool
 auto io_notifier_epoll::next_events(
     std::vector<std::pair<async_operation*, poll_status>>& ready_events, std::chrono::milliseconds timeout) -> void
 {
-    auto ready_set = std::array<event_t, m_max_events>{};
-    int  num_ready = ::epoll_wait(m_fd, ready_set.data(), ready_set.size(), timeout.count());
+    auto             ready_set = std::array<event_t, m_max_events>{};
+    int              num_ready = ::epoll_wait(m_fd, ready_set.data(), ready_set.size(), timeout.count());
+    std::scoped_lock lock{m_mutex};
+    for (auto fd : m_failed_fds)
+    {
+        auto& registration = m_registrations[fd];
+        if (registration.error != 0)
+        {
+            if (registration.reader != nullptr)
+            {
+                ready_events.emplace_back(registration.reader, poll_status::error);
+            }
+            if (registration.writer != nullptr)
+            {
+                ready_events.emplace_back(registration.writer, poll_status::error);
+            }
+        }
+    }
+    m_failed_fds.clear();
     for (int i = 0; i < num_ready; ++i)
     {
-        auto* data = ready_set[i].data.ptr;
-        if (data == wake_tag)
+        const auto& event        = ready_set[i];
+        auto&       registration = m_registrations[event.data.fd];
+        if (registration.tag != nullptr)
         {
-            uint64_t value;
-            ::read(m_wake_fd, &value, sizeof(value));
+            if (registration.tag == wake_tag)
+            {
+                uint64_t value;
+                ::read(m_wake_fd, &value, sizeof(value));
+            }
+            ready_events.emplace_back(static_cast<async_operation*>(registration.tag), poll_status::read);
+            continue;
         }
-        ready_events.emplace_back(static_cast<async_operation*>(data), event_to_poll_status(ready_set[i]));
+        if (registration.error != 0)
+        {
+            continue;
+        }
+        const auto error  = (event.events & EPOLLERR) != 0;
+        const auto closed = (event.events & EPOLLHUP) != 0;
+        if (registration.reader != nullptr && (event.events & (EPOLLIN | EPOLLRDHUP) || error || closed))
+        {
+            auto status = poll_status::read;
+            if (error)
+            {
+                status = poll_status::error;
+            }
+            else if (closed || (event.events & EPOLLRDHUP))
+            {
+                status = poll_status::closed;
+            }
+            ready_events.emplace_back(registration.reader, status);
+        }
+        if (registration.writer != nullptr && (event.events & EPOLLOUT || error || closed))
+        {
+            auto status = poll_status::write;
+            if (error)
+            {
+                status = poll_status::error;
+            }
+            else if (closed)
+            {
+                status = poll_status::closed;
+            }
+            ready_events.emplace_back(registration.writer, status);
+        }
     }
-}
-
-auto io_notifier_epoll::event_to_poll_status(const event_t& event) -> poll_status
-{
-    if (event.events & EPOLLIN)
-    {
-        return poll_status::read;
-    }
-    if (event.events & EPOLLOUT)
-    {
-        return poll_status::write;
-    }
-    else if (event.events & EPOLLERR)
-    {
-        return poll_status::error;
-    }
-    else if (event.events & EPOLLRDHUP || event.events & EPOLLHUP)
-    {
-        return poll_status::closed;
-    }
-    throw std::runtime_error{"invalid epoll state"};
 }
 
 } // namespace coro::detail

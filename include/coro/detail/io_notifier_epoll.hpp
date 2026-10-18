@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <ctime>
+#include <mutex>
 #include <vector>
 
 #include <sys/epoll.h>
@@ -25,12 +26,21 @@ class io_notifier_epoll
     static const constexpr std::size_t m_max_events = 16;
     static constexpr const int         m_wake_object{0};
 
-    fd_t m_fd;
-    fd_t m_wake_fd{-1};
+    struct registration
+    {
+        async_operation* reader{nullptr};
+        async_operation* writer{nullptr};
+        void*            tag{nullptr};
+        int              error{0};
+    };
+
+    fd_t                      m_fd;
+    fd_t                      m_wake_fd{-1};
+    std::mutex                m_mutex;
+    std::vector<registration> m_registrations;
+    std::vector<fd_t>         m_failed_fds;
 
     friend class detail::timer_handle;
-
-    static auto event_to_poll_status(const event_t& event) -> poll_status;
 
 public:
     /// Tag reported by next_events() after consuming a wake signal.
@@ -57,8 +67,6 @@ public:
     auto        complete_ready(async_operation& op, poll_status status) -> bool;
     /// Readiness backends release the operation immediately, so this always returns true.
     auto cancel(async_operation& op) -> bool;
-
-    auto unwatch(fd_t fd, poll_op op) -> bool;
 
     auto unwatch_timer(const timer_handle& timer) -> bool;
 
