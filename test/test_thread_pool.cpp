@@ -316,6 +316,41 @@ TEST_CASE("thread_pool::spawn_joinable", "[thread_pool]")
     REQUIRE(counter.load() == 2);
 }
 
+namespace
+{
+auto fork_join_fib(coro::thread_pool& tp, std::atomic<std::size_t>& max_queue_size, std::size_t n)
+    -> coro::task<std::size_t>
+{
+    if (n < 2)
+    {
+        co_return n;
+    }
+
+    co_await tp.schedule();
+    auto queued = tp.queue_size();
+    auto seen   = max_queue_size.load(std::memory_order::relaxed);
+    while (queued > seen && !max_queue_size.compare_exchange_weak(seen, queued, std::memory_order::relaxed)) {}
+
+    auto [x, y] =
+        co_await coro::when_all(fork_join_fib(tp, max_queue_size, n - 1), fork_join_fib(tp, max_queue_size, n - 2));
+    co_return x.return_value() + y.return_value();
+}
+} // namespace
+
+TEST_CASE("thread_pool runs recursive fork-join work depth first", "[thread_pool]")
+{
+    // https://github.com/jbaldwin/libcoro/issues/446
+    // Expanding a fork-join tree breadth first keeps the whole frontier queued, and every queued coroutine keeps its
+    // frame and its when_all frames alive.  Depth first, an executor only holds one pending sibling per tree level.
+    constexpr std::size_t depth        = 16;
+    const auto            thread_count = GENERATE(1u, 4u);
+    auto                  tp = coro::thread_pool::make_unique(coro::thread_pool::options{.thread_count = thread_count});
+    std::atomic<std::size_t> max_queue_size{0};
+
+    REQUIRE(coro::sync_wait(fork_join_fib(*tp, max_queue_size, depth)) == 987);
+    REQUIRE(max_queue_size.load() <= thread_count * depth);
+}
+
 TEST_CASE("~thread_pool", "[thread_pool]")
 {
     std::cerr << "[~thread_pool]\n\n";

@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -19,8 +20,15 @@
 namespace coro
 {
 /**
- * Creates a thread pool that executes arbitrary coroutine tasks in a FIFO scheduler policy.
+ * Creates a thread pool that executes arbitrary coroutine tasks.
  * The thread pool by default will create an execution thread per available core on the system.
+ *
+ * Each executor thread owns a LIFO queue.  A coroutine that awaits `schedule()` while running on one of this pool's
+ * executor threads is pushed onto that executor's queue and runs before older work, so recursive fork-join work
+ * (`schedule()` followed by `when_all()` of child tasks) runs depth first and only keeps a bounded number of
+ * coroutine frames alive.  Idle executors steal the oldest task from another executor's queue.  Everything else
+ * (`schedule()` from other threads, `yield()`, `resume()`, `spawn_detached()` and `spawn_joinable()`) goes through a
+ * shared FIFO queue, so wake-up order requested by the caller is kept.
  *
  * When shutting down, either by the thread pool destructing or by manually calling shutdown()
  * the thread pool will stop accepting new tasks but will complete all tasks that were scheduled
@@ -67,6 +75,8 @@ public:
     private:
         /// @brief The thread pool that this schedule operation will execute on.
         thread_pool& m_thread_pool;
+        /// @brief Queue the coroutine behind already queued work instead of on the executor's own queue.
+        bool m_yield{false};
     };
 
     struct options
@@ -114,6 +124,8 @@ public:
     /**
      * Schedules the currently executing coroutine to be run on this thread pool.  This must be
      * called from within the coroutines function body to schedule the coroutine on the thread pool.
+     * When awaited on one of this pool's executor threads the coroutine runs before older queued work (depth first),
+     * so this is a fork point rather than a way to let other tasks run, use `yield()` for that.
      * @throw std::runtime_error If the thread pool is `shutdown()` scheduling new tasks is not permitted.
      * @return The schedule operation to switch from the calling scheduling thread to the executor thread
      *         pool thread.
@@ -179,16 +191,18 @@ public:
     auto resume(const range_type& handles) noexcept -> std::size_t
     {
         m_size.fetch_add(std::size(handles), std::memory_order::release);
+        // Count the tasks before publishing them so consumers never decrement the counter below zero.
+        m_queue_size.fetch_add(std::size(handles), std::memory_order::seq_cst);
 
         std::size_t null_handles{0};
 
         {
-            std::scoped_lock lk{m_wait_mutex};
+            std::scoped_lock lk{m_global_mutex};
             for (const auto& handle : handles)
             {
                 if (handle != nullptr) [[likely]]
                 {
-                    m_queue.emplace_back(handle);
+                    m_global_queue.emplace_back(handle);
                 }
                 else
                 {
@@ -199,32 +213,24 @@ public:
 
         if (null_handles > 0)
         {
+            m_queue_size.fetch_sub(null_handles, std::memory_order::release);
             m_size.fetch_sub(null_handles, std::memory_order::release);
         }
 
         std::size_t total = std::size(handles) - null_handles;
-        if (total >= m_threads.size())
-        {
-            m_wait_cv.notify_all();
-        }
-        else
-        {
-            for (uint64_t i = 0; i < total; ++i)
-            {
-                m_wait_cv.notify_one();
-            }
-        }
+        wake(total);
 
         return total;
     }
 
     /**
-     * Immediately yields the current task and places it at the end of the queue of tasks waiting
-     * to be processed.  This will immediately be picked up again once it naturally goes through the
-     * FIFO task queue.  This function is useful to yielding long processing tasks to let other tasks
+     * Immediately yields the current task and places it at the end of the shared queue of tasks waiting
+     * to be processed.  Executor threads run their own queued work first and then pick the shared queue
+     * in FIFO order.  This function is useful to yielding long processing tasks to let other tasks
      * get processing time.
+     * @throw std::runtime_error If the thread pool is `shutdown()` scheduling new tasks is not permitted.
      */
-    [[nodiscard]] auto yield() -> schedule_operation { return schedule(); }
+    [[nodiscard]] auto yield() -> schedule_operation;
 
     /**
      * Shuts down the thread pool.  This will finish any tasks scheduled prior to calling this
@@ -246,30 +252,38 @@ public:
     auto empty() const noexcept -> bool { return size() == 0; }
 
     /**
-     * @return The number of tasks waiting in the task queue to be executed.
+     * @return The number of tasks waiting in the task queues to be executed.
      */
-    auto queue_size() const noexcept -> std::size_t
-    {
-        std::atomic_thread_fence(std::memory_order::acquire);
-        return m_queue.size();
-    }
+    auto queue_size() const noexcept -> std::size_t { return m_queue_size.load(std::memory_order::acquire); }
 
     /**
-     * @return True if the task queue is currently empty.
+     * @return True if the task queues are currently empty.
      */
     auto queue_empty() const noexcept -> bool { return queue_size() == 0; }
 
 private:
+    /// Queue owned by one executor thread.  The owner pushes and pops at the back (LIFO), other executors steal
+    /// from the front (FIFO) so they take the oldest and usually largest piece of work.
+    struct worker_queue
+    {
+        std::mutex                          m_mutex;
+        std::deque<std::coroutine_handle<>> m_queue;
+    };
+
     /// The configuration options.
     options m_opts;
     /// The background executor threads.
     std::vector<std::thread> m_threads;
+    /// One queue per executor thread, indexed by the executor's idx.
+    std::unique_ptr<worker_queue[]> m_worker_queues;
+    /// Guards m_global_queue.
+    std::mutex m_global_mutex;
+    /// FIFO queue of tasks scheduled from outside the executors, yielded, or resumed.
+    std::deque<std::coroutine_handle<>> m_global_queue;
     /// Mutex for executor threads to sleep on the condition variable.
     std::mutex m_wait_mutex;
     /// Condition variable for each executor thread to wait on when no tasks are available.
     std::condition_variable_any m_wait_cv;
-    /// FIFO queue of tasks waiting to be executed.
-    std::deque<std::coroutine_handle<>> m_queue;
 
     /**
      * Each background thread runs from this function.
@@ -277,12 +291,26 @@ private:
      */
     auto executor(std::size_t idx) -> void;
     /**
-     * @param handle Schedules the given coroutine to be executed upon the first available thread.
+     * Queues the given coroutine to be executed upon the first available thread.
+     * @param handle The coroutine to queue.
+     * @param global Use the shared FIFO queue even when called from one of this pool's executor threads.
      */
-    auto schedule_impl(std::coroutine_handle<> handle) noexcept -> void;
+    auto enqueue(std::coroutine_handle<> handle, bool global) noexcept -> void;
+    /// Pops the newest task from the executor's own queue.
+    auto pop_local(std::size_t idx) noexcept -> std::coroutine_handle<>;
+    /// Pops the oldest task from the shared queue.
+    auto pop_global() noexcept -> std::coroutine_handle<>;
+    /// Takes the oldest task from another executor's queue.
+    auto steal(std::size_t idx) noexcept -> std::coroutine_handle<>;
+    /// Wakes up to `count` sleeping executor threads.
+    auto wake(std::size_t count) noexcept -> void;
 
     /// The number of tasks in the queue + currently executing.
     std::atomic<std::size_t> m_size{0};
+    /// The number of tasks waiting in all queues.
+    std::atomic<std::size_t> m_queue_size{0};
+    /// The number of executor threads waiting on m_wait_cv.
+    std::atomic<std::size_t> m_sleeping{0};
     /// Has the thread pool been requested to shut down?
     std::atomic<bool> m_shutdown_requested{false};
 };

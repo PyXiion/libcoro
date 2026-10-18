@@ -1,6 +1,8 @@
 #include "coro/thread_pool.hpp"
 #include "coro/detail/task_self_deleting.hpp"
 
+#include <cstdint>
+
 namespace coro
 {
 
@@ -15,19 +17,33 @@ static auto
 
 } // namespace detail
 
+namespace
+{
+/// Identifies the executor thread running on this thread so `schedule()` can find its queue.
+struct current_executor
+{
+    const thread_pool* m_thread_pool{nullptr};
+    std::size_t        m_idx{0};
+};
+
+thread_local current_executor t_current_executor{};
+
+/// Executors check the shared queue first once every this many iterations, so tasks resumed or scheduled from other
+/// threads are not starved by long running fork-join work on the executor's own queue.
+constexpr std::uint32_t global_queue_interval{61};
+} // namespace
+
 thread_pool::schedule_operation::schedule_operation(thread_pool& tp) noexcept : m_thread_pool(tp)
 {
 }
 
 auto thread_pool::schedule_operation::await_suspend(std::coroutine_handle<> awaiting_coroutine) noexcept -> void
-{
-    m_thread_pool.schedule_impl(awaiting_coroutine);
-}
+{ m_thread_pool.enqueue(awaiting_coroutine, m_yield); }
 
-thread_pool::thread_pool(options&& opts, private_constructor) : m_opts(opts)
-{
-    m_threads.reserve(m_opts.thread_count);
-}
+thread_pool::thread_pool(options&& opts, private_constructor)
+    : m_opts(opts),
+      m_worker_queues(std::make_unique<worker_queue[]>(m_opts.thread_count))
+{ m_threads.reserve(m_opts.thread_count); }
 
 auto thread_pool::make_unique(options opts) -> std::unique_ptr<thread_pool>
 {
@@ -62,6 +78,13 @@ auto thread_pool::schedule() -> schedule_operation
     }
 }
 
+auto thread_pool::yield() -> schedule_operation
+{
+    auto operation    = schedule();
+    operation.m_yield = true;
+    return operation;
+}
+
 auto thread_pool::spawn_detached(coro::task<void>&& task) noexcept -> bool
 {
     m_size.fetch_add(1, std::memory_order::release);
@@ -90,7 +113,7 @@ auto thread_pool::resume(std::coroutine_handle<> handle) noexcept -> bool
         return false;
     }
 
-    schedule_impl(handle);
+    enqueue(handle, true);
     return true;
 }
 
@@ -118,50 +141,63 @@ auto thread_pool::shutdown() noexcept -> void
 
 auto thread_pool::executor(std::size_t idx) -> void
 {
+    t_current_executor = current_executor{.m_thread_pool = this, .m_idx = idx};
+
     if (m_opts.on_thread_start_functor != nullptr)
     {
         m_opts.on_thread_start_functor(idx);
     }
 
-    // Process until shutdown is requested.
-    while (!m_shutdown_requested.load(std::memory_order::acquire))
+    std::uint32_t iterations{0};
+    while (true)
     {
-        std::unique_lock<std::mutex> lk{m_wait_mutex};
-        m_wait_cv.wait(lk, [&]() { return !m_queue.empty() || m_shutdown_requested.load(std::memory_order::acquire); });
-
-        if (m_queue.empty())
+        std::coroutine_handle<> handle{};
+        if (++iterations == global_queue_interval)
         {
+            iterations = 0;
+            handle     = pop_global();
+        }
+        if (handle == nullptr)
+        {
+            handle = pop_local(idx);
+        }
+        if (handle == nullptr)
+        {
+            handle = pop_global();
+        }
+        if (handle == nullptr)
+        {
+            handle = steal(idx);
+        }
+
+        if (handle != nullptr)
+        {
+            handle.resume();
+            m_size.fetch_sub(1, std::memory_order::release);
             continue;
         }
 
-        auto handle = m_queue.front();
-        m_queue.pop_front();
-        lk.unlock();
-
-        // Release the lock while executing the coroutine.
-        handle.resume();
-        m_size.fetch_sub(1, std::memory_order::release);
-    }
-
-    // Process until there are no ready tasks left.
-    while (m_size.load(std::memory_order::acquire) > 0)
-    {
-        std::unique_lock<std::mutex> lk{m_wait_mutex};
-        // m_size will only drop to zero once all executing coroutines are finished
-        // but the queue could be empty for threads that finished early.
-        if (m_queue.empty())
+        // Once shutdown is requested run until no queued tasks are left.
+        if (m_shutdown_requested.load(std::memory_order::acquire))
         {
             break;
         }
 
-        auto handle = m_queue.front();
-        m_queue.pop_front();
-        lk.unlock();
-
-        // Release the lock while executing the coroutine.
-        handle.resume();
-        m_size.fetch_sub(1, std::memory_order::release);
+        std::unique_lock<std::mutex> lk{m_wait_mutex};
+        // Pairs with enqueue(): it increments m_queue_size and then reads m_sleeping, both seq_cst, so either this
+        // executor sees the new task or the enqueuing thread sees this sleeper and notifies it under m_wait_mutex.
+        m_sleeping.fetch_add(1, std::memory_order::seq_cst);
+        m_wait_cv.wait(
+            lk,
+            [&]()
+            {
+                return m_queue_size.load(std::memory_order::seq_cst) > 0 ||
+                       m_shutdown_requested.load(std::memory_order::acquire);
+            });
+        m_sleeping.fetch_sub(1, std::memory_order::relaxed);
     }
+
+    t_current_executor = current_executor{};
 
     if (m_opts.on_thread_stop_functor != nullptr)
     {
@@ -169,17 +205,93 @@ auto thread_pool::executor(std::size_t idx) -> void
     }
 }
 
-auto thread_pool::schedule_impl(std::coroutine_handle<> handle) noexcept -> void
+auto thread_pool::enqueue(std::coroutine_handle<> handle, bool global) noexcept -> void
 {
-    if (handle == nullptr || handle.done())
+    // Count the task before publishing it so consumers never decrement the counter below zero.
+    m_queue_size.fetch_add(1, std::memory_order::seq_cst);
+
+    if (!global && t_current_executor.m_thread_pool == this)
+    {
+        auto&            local = m_worker_queues[t_current_executor.m_idx];
+        std::scoped_lock lk{local.m_mutex};
+        local.m_queue.emplace_back(handle);
+    }
+    else
+    {
+        std::scoped_lock lk{m_global_mutex};
+        m_global_queue.emplace_back(handle);
+    }
+
+    wake(1);
+}
+
+auto thread_pool::pop_local(std::size_t idx) noexcept -> std::coroutine_handle<>
+{
+    auto&            local = m_worker_queues[idx];
+    std::scoped_lock lk{local.m_mutex};
+    if (local.m_queue.empty())
+    {
+        return nullptr;
+    }
+
+    auto handle = local.m_queue.back();
+    local.m_queue.pop_back();
+    m_queue_size.fetch_sub(1, std::memory_order::release);
+    return handle;
+}
+
+auto thread_pool::pop_global() noexcept -> std::coroutine_handle<>
+{
+    std::scoped_lock lk{m_global_mutex};
+    if (m_global_queue.empty())
+    {
+        return nullptr;
+    }
+
+    auto handle = m_global_queue.front();
+    m_global_queue.pop_front();
+    m_queue_size.fetch_sub(1, std::memory_order::release);
+    return handle;
+}
+
+auto thread_pool::steal(std::size_t idx) noexcept -> std::coroutine_handle<>
+{
+    // Take a single task and go back to the own queue: draining a victim would expand its pending tasks breadth
+    // first and keep all of their coroutine frames alive at once.
+    for (std::size_t i = 1; i < m_opts.thread_count; ++i)
+    {
+        auto&            victim = m_worker_queues[(idx + i) % m_opts.thread_count];
+        std::scoped_lock lk{victim.m_mutex};
+        if (!victim.m_queue.empty())
+        {
+            auto handle = victim.m_queue.front();
+            victim.m_queue.pop_front();
+            m_queue_size.fetch_sub(1, std::memory_order::release);
+            return handle;
+        }
+    }
+
+    return nullptr;
+}
+
+auto thread_pool::wake(std::size_t count) noexcept -> void
+{
+    if (count == 0 || m_sleeping.load(std::memory_order::seq_cst) == 0)
     {
         return;
     }
 
+    std::scoped_lock lk{m_wait_mutex};
+    if (count >= m_opts.thread_count)
     {
-        std::scoped_lock lk{m_wait_mutex};
-        m_queue.emplace_back(handle);
-        m_wait_cv.notify_one();
+        m_wait_cv.notify_all();
+    }
+    else
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            m_wait_cv.notify_one();
+        }
     }
 }
 
