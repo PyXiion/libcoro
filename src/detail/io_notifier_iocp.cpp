@@ -83,20 +83,23 @@ auto io_notifier_iocp::associate(async_operation& op) -> int
     {
         return owner == m_id ? 0 : WSAEINVAL;
     }
-    // Some Windows SDKs omit FileIoCompletionNotificationInformation (41) and its structure.
+    // Not every Windows SDK declares NtQueryInformationFile, FileIoCompletionNotificationInformation (41) or its
+    // structure, so spell out the ntdll entry point.
     struct file_io_completion_notification_information
     {
         ULONG Flags;
     };
+    using query_information_file = LONG(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+    constexpr ULONG file_io_completion_notification_class{41};
     // Cast through void(*)() so compilers accept the FARPROC conversion without -Wcast-function-type.
-    static const auto query_information = reinterpret_cast<decltype(&::NtQueryInformationFile)>(
+    static const auto query_information = reinterpret_cast<query_information_file>(
         reinterpret_cast<void (*)()>(::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
     auto                                        handle = reinterpret_cast<HANDLE>(op.m_fd);
     IO_STATUS_BLOCK                             iosb{};
     file_io_completion_notification_information info{};
     // If the query is unavailable or fails, assume the mode is unset.
     if (query_information != nullptr &&
-        query_information(handle, &iosb, &info, sizeof(info), static_cast<FILE_INFORMATION_CLASS>(41)) >= 0 &&
+        query_information(handle, &iosb, &info, sizeof(info), file_io_completion_notification_class) >= 0 &&
         (info.Flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0)
     {
         // Synchronous success must post a packet so the scheduler can retire the OVERLAPPED.
