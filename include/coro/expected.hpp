@@ -1,6 +1,11 @@
 #pragma once
 
-#if (__cpp_lib_expected)
+// <version> defines the feature test macro; without it the check below is evaluated before any standard
+// library header was seen, so the alias resolved per translation unit depending on the include order
+// (a silent ODR mismatch that MSVC reports as an unresolved return type at link time).
+#include <version>
+
+#if defined(__cpp_lib_expected)
     #include <expected>
 namespace coro
 {

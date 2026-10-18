@@ -222,6 +222,10 @@ struct receive_wrapper
     auto await_resume() -> auto { return m_op.await_resume(); }
 };
 
+/// Spelled out because older compilers (clang 16) cannot deduce this aggregate's arguments.
+template<typename Operation, typename Hook>
+receive_wrapper(Operation&, Hook) -> receive_wrapper<Operation, Hook>;
+
 } // namespace
 
 TEST_CASE("udp recv_from truncation", "[udp]")
